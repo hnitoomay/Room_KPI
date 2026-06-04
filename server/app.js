@@ -8,9 +8,10 @@ const { Pool } = pg;
 const app = express();
 const port = process.env.PORT || 3001;
 const databaseUrl = process.env.DATABASE_URL;
+const isLocalDatabase = databaseUrl?.includes('localhost') || databaseUrl?.includes('127.0.0.1');
 const pool = new Pool({
   connectionString: databaseUrl,
-  ssl: databaseUrl?.includes('supabase.co') ? { rejectUnauthorized: false } : undefined,
+  ssl: databaseUrl && !isLocalDatabase ? { rejectUnauthorized: false } : undefined,
   max: Number(process.env.DATABASE_POOL_MAX || 5),
 });
 
@@ -317,8 +318,27 @@ async function replaceRoomUsageHistory(client, scheduleDate, campusName, rows) {
   return historyRows.length;
 }
 
-app.get('/api/health', (_request, response) => {
-  response.json({ ok: true });
+app.get('/api/health', async (_request, response) => {
+  if (!databaseUrl) {
+    return response.status(503).json({
+      ok: false,
+      databaseConfigured: false,
+      error: 'DATABASE_URL is not configured.',
+    });
+  }
+
+  try {
+    await pool.query('SELECT 1');
+    response.json({ ok: true, databaseConfigured: true, databaseConnected: true });
+  } catch (error) {
+    console.error('Database health check failed.', error);
+    response.status(503).json({
+      ok: false,
+      databaseConfigured: true,
+      databaseConnected: false,
+      error: error.code || error.message,
+    });
+  }
 });
 
 app.get('/api/weekly-kpi/schedule', async (request, response) => {

@@ -63,6 +63,14 @@ The LED display fetches real rows from `GET /api/schedule/tomorrow` every 60 sec
 The Express API is exported through `api/index.js`, and `vercel.json` routes `/api/*` requests to it while preserving SPA routes such as `/entrance-led`.
 For Supabase, use its pooled PostgreSQL connection string for `DATABASE_URL`. `DATABASE_POOL_MAX` defaults to `5` and can be lowered if the database has a strict connection limit.
 
+After deployment, open `/api/health` on the Vercel domain. A working deployment returns:
+
+```json
+{"ok":true,"databaseConfigured":true,"databaseConnected":true}
+```
+
+If Vercel logs show `ECONNREFUSED 127.0.0.1:3001`, confirm the latest commit containing `vercel.json` is deployed and that the Vercel Build Command is `npm run build`, not `npm run dev`. Also confirm `DATABASE_URL` in Vercel uses the Supabase pooled connection string rather than a localhost connection string.
+
 ## Security
 
 The schedule dashboard and write API endpoints do not currently require authentication. Do not treat a public deployment as production-ready until access control is added, because anyone who can reach the site can save or finalize schedules.
