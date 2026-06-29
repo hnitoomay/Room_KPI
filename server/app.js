@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
+import { getFixedRoomNames } from '../shared/campusRooms.js';
 
 const { Pool } = pg;
 
@@ -27,8 +28,14 @@ const columns = [
   'topic_batch',
   'num_students',
   'student_service_name',
+  'recurrence_group_id',
+  'recurrence_days',
+  'recurrence_start_date',
+  'recurrence_end_date',
+  'recurrence_exception_dates',
 ];
 const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const weekdayOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
 function parseTimeLabel(label) {
   const match = String(label)
@@ -94,6 +101,33 @@ function parseMonth(month) {
   return { startDate, endDate };
 }
 
+function getNextDateInput(scheduleDate) {
+  const parsedDate = parseDateInput(scheduleDate);
+
+  if (!parsedDate) {
+    return null;
+  }
+
+  const nextDate = new Date(`${parsedDate}T00:00:00Z`);
+  nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+  return parseDateInput(nextDate);
+}
+
+function parseDateRange(startDateInput, endDateInput) {
+  const startDate = parseDateInput(startDateInput);
+  const endDate = parseDateInput(endDateInput);
+
+  if (!startDate || !endDate || startDate > endDate) {
+    return null;
+  }
+
+  return {
+    startDate,
+    endDate,
+    exclusiveEndDate: getNextDateInput(endDate),
+  };
+}
+
 function parseDateInput(dateInput) {
   if (dateInput instanceof Date && !Number.isNaN(dateInput.getTime())) {
     return `${dateInput.getUTCFullYear()}-${String(dateInput.getUTCMonth() + 1).padStart(2, '0')}-${String(
@@ -136,8 +170,217 @@ function getTomorrowDayName() {
   return days[tomorrow.getDay()];
 }
 
+function normalizeRecurrenceDays(value) {
+  const sourceValues = Array.isArray(value)
+    ? value
+    : String(value || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+  return weekdayOrder.filter((dayName) => sourceValues.includes(dayName));
+}
+
+function serializeRecurrenceDays(dayNames) {
+  return normalizeRecurrenceDays(dayNames).join(',');
+}
+
+function normalizeRecurrenceExceptionDates(value) {
+  const sourceValues = Array.isArray(value)
+    ? value
+    : String(value || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+  return [...new Set(sourceValues.map((dateValue) => parseDateInput(dateValue)).filter(Boolean))].sort();
+}
+
+function serializeRecurrenceExceptionDates(dateValues) {
+  return normalizeRecurrenceExceptionDates(dateValues).join(',');
+}
+
+function isRecurringRow(row) {
+  return (
+    row.recurrence_group_id &&
+    row.recurrence_start_date &&
+    row.recurrence_end_date &&
+    row.recurrence_days.length > 0
+  );
+}
+
+function toUtcDate(scheduleDate) {
+  return new Date(`${scheduleDate}T00:00:00Z`);
+}
+
+function formatConflictRow(row) {
+  return `${row.schedule_date} ${row.room_name} ${row.time_slot}`;
+}
+
+function buildConflictMessage(conflicts) {
+  const items = conflicts.slice(0, 3).map(({ incoming, existing }) => {
+    if (existing) {
+      return `${formatConflictRow(incoming)} conflicts with ${formatConflictRow(existing)}`;
+    }
+
+    return `${formatConflictRow(incoming)} conflicts with another repeated session in this save`;
+  });
+
+  return `Conflicting room schedules found: ${items.join('; ')}. Edit this conflict session schedule and try again.`;
+}
+
+function expandRecurringRow(row) {
+  if (!isRecurringRow(row)) {
+    return [row];
+  }
+
+  const startDate = toUtcDate(row.recurrence_start_date);
+  const endDate = toUtcDate(row.recurrence_end_date);
+  const generatedRows = [];
+
+  for (let cursor = new Date(startDate); cursor <= endDate; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    const scheduleDate = parseDateInput(cursor);
+    const dayName = getDayNameFromDate(scheduleDate);
+
+    if (!row.recurrence_days.includes(dayName)) {
+      continue;
+    }
+
+    if (row.recurrence_exception_dates.includes(scheduleDate)) {
+      continue;
+    }
+
+    generatedRows.push({
+      ...row,
+      schedule_date: scheduleDate,
+      day_name: dayName,
+    });
+  }
+
+  return generatedRows;
+}
+
+function timeSlotsOverlap(firstTimeSlot, secondTimeSlot) {
+  const [firstStartLabel, firstEndLabel] = String(firstTimeSlot).split(' - ');
+  const [secondStartLabel, secondEndLabel] = String(secondTimeSlot).split(' - ');
+  const firstStart = parseTimeLabel(firstStartLabel);
+  const firstEnd = parseTimeLabel(firstEndLabel);
+  const secondStart = parseTimeLabel(secondStartLabel);
+  const secondEnd = parseTimeLabel(secondEndLabel);
+
+  if ([firstStart, firstEnd, secondStart, secondEnd].some((value) => value === null)) {
+    return false;
+  }
+
+  return firstStart < secondEnd && secondStart < firstEnd;
+}
+
+function findScheduleConflicts(candidateRows, existingRows) {
+  const conflicts = [];
+
+  for (let index = 0; index < candidateRows.length; index += 1) {
+    const incoming = candidateRows[index];
+
+    for (let compareIndex = index + 1; compareIndex < candidateRows.length; compareIndex += 1) {
+      const otherCandidate = candidateRows[compareIndex];
+
+      if (
+        incoming.schedule_date === otherCandidate.schedule_date &&
+        incoming.room_name === otherCandidate.room_name &&
+        timeSlotsOverlap(incoming.time_slot, otherCandidate.time_slot)
+      ) {
+        conflicts.push({ incoming, existing: otherCandidate });
+      }
+    }
+
+    existingRows.forEach((existing) => {
+      const sameRecurringSeries =
+        incoming.recurrence_group_id &&
+        existing.recurrence_group_id &&
+        incoming.recurrence_group_id === existing.recurrence_group_id;
+
+      if (
+        !sameRecurringSeries &&
+        incoming.schedule_date === existing.schedule_date &&
+        incoming.room_name === existing.room_name &&
+        timeSlotsOverlap(incoming.time_slot, existing.time_slot)
+      ) {
+        conflicts.push({ incoming, existing });
+      }
+    });
+  }
+
+  return conflicts;
+}
+
+function serializeRowIdentity(row) {
+  return [
+    row.schedule_date,
+    row.day_name,
+    row.campus_name,
+    row.room_name,
+    row.time_slot,
+    row.topic_batch,
+    row.num_students,
+    row.student_service_name,
+    row.recurrence_group_id,
+    serializeRecurrenceDays(row.recurrence_days),
+    row.recurrence_start_date,
+    row.recurrence_end_date,
+    serializeRecurrenceExceptionDates(row.recurrence_exception_dates),
+  ].join('||');
+}
+
+function dedupeRows(rows) {
+  const uniqueRows = [];
+  const seen = new Set();
+
+  rows.forEach((row) => {
+    const identity = serializeRowIdentity(row);
+
+    if (seen.has(identity)) {
+      return;
+    }
+
+    seen.add(identity);
+    uniqueRows.push(row);
+  });
+
+  return uniqueRows;
+}
+
+function serializeSlotIdentity(row) {
+  return [row.schedule_date, row.campus_name, row.room_name, row.time_slot].join('||');
+}
+
+function mergeRowsBySlot(rows) {
+  const rowMap = new Map();
+
+  rows.forEach((row) => {
+    rowMap.set(serializeSlotIdentity(row), row);
+  });
+
+  return Array.from(rowMap.values());
+}
+
+function normalizeRecurringGroupIds(value) {
+  const sourceValues = Array.isArray(value) ? value : [];
+  return [...new Set(sourceValues.map((item) => String(item || '').trim()).filter(Boolean))];
+}
+
 function normalizeRow(row) {
   const scheduleDate = parseDateInput(row.schedule_date);
+  const recurrenceDays = normalizeRecurrenceDays(row.recurrence_days);
+  const recurrenceStartDate = parseDateInput(row.recurrence_start_date);
+  const recurrenceEndDate = parseDateInput(row.recurrence_end_date);
+  const recurrenceExceptionDates = normalizeRecurrenceExceptionDates(row.recurrence_exception_dates);
+  const recurrenceGroupId = String(row.recurrence_group_id || '').trim() || null;
+  const hasValidRecurrence =
+    recurrenceGroupId &&
+    recurrenceStartDate &&
+    recurrenceEndDate &&
+    recurrenceDays.length > 0 &&
+    recurrenceStartDate <= recurrenceEndDate;
 
   return {
     schedule_date: scheduleDate,
@@ -149,6 +392,11 @@ function normalizeRow(row) {
     num_students: String(row.num_students || '').trim(),
     student_service_name: String(row.student_service_name || '').trim() || null,
     room_capacity: String(row.room_capacity ?? row.capacity ?? row.num_students ?? '').trim(),
+    recurrence_group_id: hasValidRecurrence ? recurrenceGroupId : null,
+    recurrence_days: hasValidRecurrence ? recurrenceDays : [],
+    recurrence_start_date: hasValidRecurrence ? recurrenceStartDate : null,
+    recurrence_end_date: hasValidRecurrence ? recurrenceEndDate : null,
+    recurrence_exception_dates: hasValidRecurrence ? recurrenceExceptionDates : [],
   };
 }
 
@@ -160,7 +408,21 @@ function buildBulkInsert(rows) {
   const values = [];
   const placeholders = rows.map((row, rowIndex) => {
     const offset = rowIndex * columns.length;
-    values.push(...columns.map((column) => row[column]));
+    values.push(
+      row.schedule_date,
+      row.day_name,
+      row.campus_name,
+      row.room_name,
+      row.time_slot,
+      row.topic_batch,
+      row.num_students,
+      row.student_service_name,
+      row.recurrence_group_id,
+      serializeRecurrenceDays(row.recurrence_days),
+      row.recurrence_start_date,
+      row.recurrence_end_date,
+      serializeRecurrenceExceptionDates(row.recurrence_exception_dates),
+    );
     return `(${columns.map((_, columnIndex) => `$${offset + columnIndex + 1}`).join(', ')})`;
   });
 
@@ -176,6 +438,31 @@ async function ensureDatabaseSchema() {
   await pool.query(`
     ALTER TABLE weekly_kpi
     ADD COLUMN IF NOT EXISTS student_service_name VARCHAR(100)
+  `);
+
+  await pool.query(`
+    ALTER TABLE weekly_kpi
+    ADD COLUMN IF NOT EXISTS recurrence_group_id VARCHAR(100)
+  `);
+
+  await pool.query(`
+    ALTER TABLE weekly_kpi
+    ADD COLUMN IF NOT EXISTS recurrence_days VARCHAR(100)
+  `);
+
+  await pool.query(`
+    ALTER TABLE weekly_kpi
+    ADD COLUMN IF NOT EXISTS recurrence_start_date DATE
+  `);
+
+  await pool.query(`
+    ALTER TABLE weekly_kpi
+    ADD COLUMN IF NOT EXISTS recurrence_end_date DATE
+  `);
+
+  await pool.query(`
+    ALTER TABLE weekly_kpi
+    ADD COLUMN IF NOT EXISTS recurrence_exception_dates VARCHAR(255)
   `);
 
   await pool.query(`
@@ -241,7 +528,13 @@ async function ensureDatabaseSchema() {
   `);
 }
 
-function normalizeRoomNames(rooms, rows = []) {
+function normalizeRoomNames(campusName, rooms, rows = []) {
+  const fixedRooms = getFixedRoomNames(campusName);
+
+  if (fixedRooms.length > 0) {
+    return fixedRooms;
+  }
+
   const roomNames = [];
   const seenRooms = new Set();
 
@@ -318,6 +611,142 @@ async function replaceRoomUsageHistory(client, scheduleDate, campusName, rows) {
   return historyRows.length;
 }
 
+async function finalizeScheduleForCampus(client, scheduleDate, campusName) {
+  const scheduleResult = await client.query(
+    `SELECT schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name,
+            recurrence_group_id, recurrence_days, recurrence_start_date, recurrence_end_date, recurrence_exception_dates
+     FROM weekly_kpi
+     WHERE schedule_date = $1 AND campus_name = $2
+     ORDER BY room_name, time_slot, id`,
+    [scheduleDate, campusName],
+  );
+
+  const finalizedRows = await replaceRoomUsageHistory(
+    client,
+    scheduleDate,
+    campusName,
+    scheduleResult.rows.map(normalizeRow).filter(isPublishable),
+  );
+
+  await client.query(
+    `INSERT INTO schedule_finalization (schedule_date, campus_name, finalized_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (schedule_date, campus_name)
+     DO UPDATE SET finalized_at = EXCLUDED.finalized_at`,
+    [scheduleDate, campusName],
+  );
+
+  return finalizedRows;
+}
+
+function getTimeZoneParts(timeZone, date = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  return formatter.formatToParts(date).reduce((parts, item) => {
+    if (item.type !== 'literal') {
+      parts[item.type] = item.value;
+    }
+
+    return parts;
+  }, {});
+}
+
+function getTimeZoneDateInput(timeZone, date = new Date()) {
+  const parts = getTimeZoneParts(timeZone, date);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+let autoFinalizeTimer = null;
+let lastAutoFinalizeKey = null;
+let autoFinalizeInFlight = false;
+
+function startAutoFinalizeScheduler() {
+  if (autoFinalizeTimer) {
+    return;
+  }
+
+  const autoFinalizeHour = Number(process.env.AUTO_FINALIZE_HOUR || 23);
+  const autoFinalizeMinute = Number(process.env.AUTO_FINALIZE_MINUTE || 0);
+  const autoFinalizeTimeZone = process.env.AUTO_FINALIZE_TIMEZONE || 'Asia/Yangon';
+
+  async function runAutoFinalizeTick() {
+    const nowParts = getTimeZoneParts(autoFinalizeTimeZone);
+    const scheduleDate = `${nowParts.year}-${nowParts.month}-${nowParts.day}`;
+
+    if (Number(nowParts.hour) !== autoFinalizeHour || Number(nowParts.minute) < autoFinalizeMinute) {
+      return;
+    }
+
+    if (lastAutoFinalizeKey === scheduleDate || autoFinalizeInFlight) {
+      return;
+    }
+
+    autoFinalizeInFlight = true;
+
+    try {
+      const campusResult = await pool.query(
+        `SELECT DISTINCT wk.campus_name
+         FROM weekly_kpi wk
+         WHERE wk.schedule_date = $1
+           AND NOT EXISTS (
+             SELECT 1
+            FROM schedule_finalization sf
+            WHERE sf.schedule_date = wk.schedule_date
+              AND sf.campus_name = wk.campus_name
+           )
+         ORDER BY wk.campus_name`,
+        [scheduleDate],
+      );
+
+      for (const row of campusResult.rows) {
+        const campusName = String(row.campus_name || '').trim();
+
+        if (!campusName) {
+          continue;
+        }
+
+        let client;
+
+        try {
+          client = await pool.connect();
+          await client.query('BEGIN');
+          const finalizedRows = await finalizeScheduleForCampus(client, scheduleDate, campusName);
+          await client.query('COMMIT');
+          console.log(`Auto-finalized ${campusName} for ${scheduleDate} with ${finalizedRows} session(s).`);
+        } catch (error) {
+          if (client) {
+            await client.query('ROLLBACK');
+          }
+          console.error(`Failed to auto-finalize ${campusName} for ${scheduleDate}.`, error);
+        } finally {
+          if (client) {
+            client.release();
+          }
+        }
+      }
+
+      lastAutoFinalizeKey = scheduleDate;
+    } catch (error) {
+      console.error(`Failed to scan campuses for auto-finalization on ${scheduleDate}.`, error);
+    } finally {
+      autoFinalizeInFlight = false;
+    }
+  }
+
+  autoFinalizeTimer = setInterval(runAutoFinalizeTick, 60 * 1000);
+  runAutoFinalizeTick().catch((error) => {
+    console.error('Initial auto-finalize check failed.', error);
+  });
+}
+
 app.get('/api/health', async (_request, response) => {
   if (!databaseUrl) {
     return response.status(503).json({
@@ -352,7 +781,8 @@ app.get('/api/weekly-kpi/schedule', async (request, response) => {
   try {
     const [scheduleResult, roomResult] = await Promise.all([
       pool.query(
-      `SELECT id, schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name
+      `SELECT id, schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name,
+              recurrence_group_id, recurrence_days, recurrence_start_date, recurrence_end_date, recurrence_exception_dates
        FROM weekly_kpi
        WHERE schedule_date = $1 AND campus_name = $2
        ORDER BY room_name, time_slot, id`,
@@ -367,9 +797,14 @@ app.get('/api/weekly-kpi/schedule', async (request, response) => {
       ),
     ]);
 
+    const fixedRooms = getFixedRoomNames(campusName);
+
     response.json({
-      rows: scheduleResult.rows,
-      rooms: roomResult.rows.map((row) => row.room_name),
+      rows:
+        fixedRooms.length > 0
+          ? scheduleResult.rows.filter((row) => fixedRooms.includes(row.room_name))
+          : scheduleResult.rows,
+      rooms: fixedRooms.length > 0 ? fixedRooms : roomResult.rows.map((row) => row.room_name),
     });
   } catch (error) {
     console.error(error);
@@ -389,14 +824,16 @@ app.get('/api/schedule/tomorrow', async (request, response) => {
   try {
     const result = campusName
       ? await pool.query(
-          `SELECT id, schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name
+          `SELECT id, schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name,
+                  recurrence_group_id, recurrence_days, recurrence_start_date, recurrence_end_date, recurrence_exception_dates
            FROM weekly_kpi
            WHERE schedule_date = $1 AND campus_name = $2
            ORDER BY time_slot, room_name, id`,
           [scheduleDate, campusName],
         )
       : await pool.query(
-          `SELECT id, schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name
+          `SELECT id, schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name,
+                  recurrence_group_id, recurrence_days, recurrence_start_date, recurrence_end_date, recurrence_exception_dates
            FROM weekly_kpi
            WHERE schedule_date = $1
            ORDER BY time_slot, campus_name, room_name, id`,
@@ -418,12 +855,18 @@ app.get('/api/schedule/tomorrow', async (request, response) => {
           [scheduleDate],
         );
 
+    const fixedRooms = campusName ? getFixedRoomNames(campusName) : [];
+
     response.json({
       activeCampus: campusName || 'All Campuses',
       dayName: tomorrowDayName,
       scheduleDate,
-      rows: result.rows,
-      rooms: campusName ? roomResult.rows.map((row) => row.room_name) : roomResult.rows,
+      rows: fixedRooms.length > 0 ? result.rows.filter((row) => fixedRooms.includes(row.room_name)) : result.rows,
+      rooms: campusName
+        ? fixedRooms.length > 0
+          ? fixedRooms
+          : roomResult.rows.map((row) => row.room_name)
+        : roomResult.rows,
     });
   } catch (error) {
     console.error(error);
@@ -432,15 +875,16 @@ app.get('/api/schedule/tomorrow', async (request, response) => {
 });
 
 app.get('/api/room-usage-history/summary', async (request, response) => {
-  const monthRange = parseMonth(request.query.month);
+  const dateRange =
+    parseDateRange(request.query.start_date, request.query.end_date) || parseMonth(request.query.month);
   const campusName = String(request.query.campus_name || '').trim();
 
-  if (!monthRange) {
-    return response.status(400).json({ error: 'A valid month is required, using YYYY-MM format.' });
+  if (!dateRange) {
+    return response.status(400).json({ error: 'A valid date range is required.' });
   }
 
   try {
-    const params = [monthRange.startDate, monthRange.endDate];
+    const params = [dateRange.startDate, dateRange.exclusiveEndDate];
     const campusFilter = campusName ? 'AND campus_name = $3' : '';
 
     if (campusName) {
@@ -462,7 +906,7 @@ app.get('/api/room-usage-history/summary', async (request, response) => {
       params,
     );
 
-    response.json({ rows: result.rows });
+    response.json({ rows: result.rows, startDate: dateRange.startDate, endDate: dateRange.endDate });
   } catch (error) {
     console.error(error);
     response.status(500).json({ error: 'Failed to load room usage analytics.' });
@@ -515,10 +959,14 @@ app.post('/api/weekly-kpi/matrix', async (request, response) => {
   const rows = Array.isArray(request.body?.rows)
     ? request.body.rows.map((row) => normalizeRow({ ...row, schedule_date: row.schedule_date || scheduleDate }))
     : [];
-  const roomNames = normalizeRoomNames(request.body?.rooms, rows);
+  const roomNames = normalizeRoomNames(campusName, request.body?.rooms, rows);
   const publishableRows = rows.filter(
     (row) =>
-      row.schedule_date === scheduleDate && row.day_name === dayName && row.campus_name === campusName && isPublishable(row),
+      row.schedule_date === scheduleDate &&
+      row.day_name === dayName &&
+      row.campus_name === campusName &&
+      roomNames.includes(row.room_name) &&
+      isPublishable(row),
   );
 
   if (!scheduleDate || !campusName) {
@@ -561,14 +1009,30 @@ app.post('/api/weekly-kpi/schedule', async (request, response) => {
   const scheduleDate = parseDateInput(request.body?.schedule_date);
   const dayName = scheduleDate ? getDayNameFromDate(scheduleDate) : String(request.body?.day_name || '').trim();
   const campusName = String(request.body?.campus_name || '').trim();
+  const deletedRecurringGroupIds = normalizeRecurringGroupIds(request.body?.deleted_recurrence_group_ids);
   const rows = Array.isArray(request.body?.rows)
     ? request.body.rows.map((row) => normalizeRow({ ...row, schedule_date: row.schedule_date || scheduleDate }))
     : [];
-  const roomNames = normalizeRoomNames(request.body?.rooms, rows);
+  const seriesRows = Array.isArray(request.body?.series_rows)
+    ? request.body.series_rows.map((row) => normalizeRow({ ...row, schedule_date: row.schedule_date || scheduleDate }))
+    : [];
+  const roomNames = normalizeRoomNames(campusName, request.body?.rooms, rows);
   const publishableRows = rows.filter(
     (row) =>
-      row.schedule_date === scheduleDate && row.day_name === dayName && row.campus_name === campusName && isPublishable(row),
+      row.schedule_date === scheduleDate &&
+      row.day_name === dayName &&
+      row.campus_name === campusName &&
+      roomNames.includes(row.room_name) &&
+      isPublishable(row),
   );
+  const recurringRows = seriesRows.filter(
+    (row) => row.campus_name === campusName && roomNames.includes(row.room_name) && isPublishable(row) && isRecurringRow(row),
+  );
+  const singleRows = publishableRows.filter((row) => !isRecurringRow(row));
+  const incomingRecurringGroupIds = normalizeRecurringGroupIds(recurringRows.map((row) => row.recurrence_group_id));
+  const replacedRecurringGroupIds = normalizeRecurringGroupIds([...incomingRecurringGroupIds, ...deletedRecurringGroupIds]);
+  const expandedRecurringRows = recurringRows.flatMap(expandRecurringRow);
+  const rowsToPersist = mergeRowsBySlot(dedupeRows([...expandedRecurringRows, ...singleRows]));
 
   if (!scheduleDate || !campusName) {
     return response.status(400).json({ error: 'Schedule date and campus are required.' });
@@ -579,11 +1043,51 @@ app.post('/api/weekly-kpi/schedule', async (request, response) => {
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+
+    if (rowsToPersist.length > 0) {
+      const targetDates = [...new Set(rowsToPersist.map((row) => row.schedule_date).filter(Boolean))];
+      const queryParams = [campusName, targetDates];
+      let exclusionSql = 'AND schedule_date <> $3';
+
+      queryParams.push(scheduleDate);
+
+      if (replacedRecurringGroupIds.length > 0) {
+        exclusionSql += ' AND (recurrence_group_id IS NULL OR recurrence_group_id <> ALL($4::text[]))';
+        queryParams.push(replacedRecurringGroupIds);
+      }
+
+      const existingResult = await client.query(
+        `SELECT schedule_date, room_name, time_slot, topic_batch, recurrence_group_id
+         FROM weekly_kpi
+         WHERE campus_name = $1
+           AND schedule_date = ANY($2::date[])
+           ${exclusionSql}`,
+        queryParams,
+      );
+      const conflicts = findScheduleConflicts(rowsToPersist, existingResult.rows);
+
+      if (conflicts.length > 0) {
+        await client.query('ROLLBACK');
+        return response.status(409).json({
+          error: buildConflictMessage(conflicts),
+          conflicts: conflicts.slice(0, 10),
+        });
+      }
+    }
+
     await client.query('DELETE FROM weekly_kpi WHERE schedule_date = $1 AND campus_name = $2', [scheduleDate, campusName]);
+
+    if (replacedRecurringGroupIds.length > 0) {
+      await client.query(
+        'DELETE FROM weekly_kpi WHERE campus_name = $1 AND recurrence_group_id = ANY($2::text[])',
+        [campusName, replacedRecurringGroupIds],
+      );
+    }
+
     await replaceScheduleRooms(client, scheduleDate, campusName, roomNames);
 
-    if (publishableRows.length > 0) {
-      const { values, placeholders } = buildBulkInsert(publishableRows);
+    if (rowsToPersist.length > 0) {
+      const { values, placeholders } = buildBulkInsert(rowsToPersist);
 
       await client.query(
         `INSERT INTO weekly_kpi (${columns.join(', ')}) VALUES ${placeholders.join(', ')}`,
@@ -592,7 +1096,12 @@ app.post('/api/weekly-kpi/schedule', async (request, response) => {
     }
 
     await client.query('COMMIT');
-    response.json({ inserted: publishableRows.length, rooms: roomNames.length });
+    response.json({
+      inserted: rowsToPersist.length,
+      sourceRows: publishableRows.length,
+      repeatedRows: expandedRecurringRows.length,
+      rooms: roomNames.length,
+    });
   } catch (error) {
     if (client) {
       await client.query('ROLLBACK');
@@ -619,30 +1128,7 @@ app.post('/api/weekly-kpi/finalize', async (request, response) => {
   try {
     client = await pool.connect();
     await client.query('BEGIN');
-
-    const scheduleResult = await client.query(
-      `SELECT schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name
-       FROM weekly_kpi
-       WHERE schedule_date = $1 AND campus_name = $2
-       ORDER BY room_name, time_slot, id`,
-      [scheduleDate, campusName],
-    );
-
-    const finalizedRows = await replaceRoomUsageHistory(
-      client,
-      scheduleDate,
-      campusName,
-      scheduleResult.rows.map(normalizeRow).filter(isPublishable),
-    );
-
-    await client.query(
-      `INSERT INTO schedule_finalization (schedule_date, campus_name, finalized_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (schedule_date, campus_name)
-       DO UPDATE SET finalized_at = EXCLUDED.finalized_at`,
-      [scheduleDate, campusName],
-    );
-
+    const finalizedRows = await finalizeScheduleForCampus(client, scheduleDate, campusName);
     await client.query('COMMIT');
     response.json({ finalizedRows, scheduleDate, campusName });
   } catch (error) {
@@ -664,6 +1150,7 @@ export default app;
 if (!process.env.VERCEL) {
   ensureDatabaseSchema()
     .then(() => {
+      startAutoFinalizeScheduler();
       app.listen(port, () => {
         console.log(`Weekly KPI API listening on http://127.0.0.1:${port}`);
       });

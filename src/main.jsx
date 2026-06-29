@@ -1,17 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import * as XLSX from 'xlsx';
+import { campusRoomDefinitions, campuses, getCampusLabel, getFixedRoomNames } from '../shared/campusRooms.js';
 import './styles.css';
 
 const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-const campuses = [
-  'Pyay Campus Room',
-  'PanChan Tower Room',
-  'U Wisara Campus Room KPI',
-  'Student Experience Room',
-  'Time City Room',
-  'Sule Room',
-];
 const timelineHours = [
   '08:00 AM',
   '09:00 AM',
@@ -25,13 +18,12 @@ const timelineHours = [
   '05:00 PM',
   '06:00 PM',
 ];
-const defaultRooms = [
-  { id: 'room-placeholder', name: '' },
-];
 const blockColors = ['bg-sky-600', 'bg-emerald-600', 'bg-amber-600', 'bg-violet-600', 'bg-rose-600'];
 
 function getCampusFromUrl() {
-  return 'Pyay Campus Room';
+  const params = new URLSearchParams(window.location.search);
+  const campusName = params.get('campus_name');
+  return campuses.includes(campusName) ? campusName : campuses[0];
 }
 
 const weekdayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -40,9 +32,16 @@ function scheduleKey(scheduleDate, campus) {
   return `${scheduleDate}::${campus}`;
 }
 
-function createSchedule() {
+function getRoomRecords(campusName) {
+  return getFixedRoomNames(campusName).map((roomName) => ({
+    id: roomIdFromName(roomName),
+    name: roomName,
+  }));
+}
+
+function createSchedule(campusName = campuses[0]) {
   return {
-    rooms: [...defaultRooms],
+    rooms: getRoomRecords(campusName),
     sessions: [],
   };
 }
@@ -70,6 +69,95 @@ function getLastActionIndexForKey(actions, key) {
 
 function roomIdFromName(roomName) {
   return `room-${roomName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || Date.now()}`;
+}
+
+function getCampusFromScheduleKey(key) {
+  return String(key).split('::').slice(1).join('::');
+}
+
+function createRecurringGroupId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+
+  return `series-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeRecurrenceDays(value) {
+  const sourceValues = Array.isArray(value)
+    ? value
+    : String(value || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+  return days.filter((dayName) => sourceValues.includes(dayName));
+}
+
+function normalizeRecurrenceExceptionDates(value) {
+  const sourceValues = Array.isArray(value)
+    ? value
+    : String(value || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+  return [...new Set(sourceValues)].sort();
+}
+
+function normalizeDateInputValue(value) {
+  const match = String(value || '')
+    .trim()
+    .match(/^(\d{4})-(\d{2})-(\d{2})/);
+
+  if (!match) {
+    return '';
+  }
+
+  return `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+function createSessionDraft(selectedDay, selectedScheduleDate, overrides = {}) {
+  return {
+    startTime: '08:00',
+    endTime: '09:00',
+    topicBatch: '',
+    numStudents: '',
+    studentServiceName: '',
+    repeatEnabled: false,
+    recurrenceDays: [selectedDay],
+    recurrenceStartDate: selectedScheduleDate,
+    recurrenceEndDate: selectedScheduleDate,
+    recurrenceGroupId: null,
+    recurrenceExceptionDates: [],
+    ...overrides,
+  };
+}
+
+function buildRecurringScheduleDates(startDate, endDate, recurrenceDays) {
+  if (!startDate || !endDate || startDate > endDate) {
+    return [];
+  }
+
+  const selectedDays = normalizeRecurrenceDays(recurrenceDays);
+  const results = [];
+  const cursor = new Date(`${startDate}T00:00:00Z`);
+  const lastDate = new Date(`${endDate}T00:00:00Z`);
+
+  while (cursor <= lastDate) {
+    const scheduleDate = `${cursor.getUTCFullYear()}-${String(cursor.getUTCMonth() + 1).padStart(2, '0')}-${String(
+      cursor.getUTCDate(),
+    ).padStart(2, '0')}`;
+    const dayName = getDayNameForDate(scheduleDate);
+
+    if (selectedDays.includes(dayName)) {
+      results.push(scheduleDate);
+    }
+
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  return results;
 }
 
 function timeToMinutes(time) {
@@ -130,7 +218,7 @@ function parseTimeSlot(timeSlot) {
   return clampSession(startTime, endTime);
 }
 
-function scheduleFromRows(rows, existingRooms = defaultRooms) {
+function scheduleFromRows(rows, existingRooms = []) {
   const roomMap = new Map(
     existingRooms.map((room) => {
       const name = typeof room === 'string' ? room : room.name;
@@ -144,18 +232,9 @@ function scheduleFromRows(rows, existingRooms = defaultRooms) {
     }),
   );
 
-  rows.forEach((row) => {
-    if (!roomMap.has(row.room_name)) {
-      roomMap.set(row.room_name, {
-        id: roomIdFromName(row.room_name),
-        name: row.room_name,
-      });
-    }
-  });
-
   const rooms = Array.from(roomMap.values());
   const sessions = rows
-    .filter((row) => row.room_name && row.time_slot && row.topic_batch)
+    .filter((row) => row.room_name && roomMap.has(row.room_name) && row.time_slot && row.topic_batch)
     .map((row) => {
       const room = roomMap.get(row.room_name);
       const parsedTime = parseTimeSlot(row.time_slot);
@@ -168,10 +247,31 @@ function scheduleFromRows(rows, existingRooms = defaultRooms) {
         topicBatch: row.topic_batch,
         numStudents: row.num_students || '',
         studentServiceName: row.student_service_name || '',
+        recurrenceGroupId: row.recurrence_group_id || null,
+        recurrenceDays: normalizeRecurrenceDays(row.recurrence_days),
+        recurrenceStartDate: normalizeDateInputValue(row.recurrence_start_date),
+        recurrenceEndDate: normalizeDateInputValue(row.recurrence_end_date),
+        recurrenceExceptionDates: normalizeRecurrenceExceptionDates(row.recurrence_exception_dates),
       };
     });
 
-  return { rooms, sessions };
+  const mergedSessions = Array.from(
+    sessions
+      .reduce((sessionMap, session) => {
+        const key = [session.roomId, session.startTime, session.endTime].join('||');
+        if (!sessionMap.has(key)) {
+          sessionMap.set(key, session);
+          return sessionMap;
+        }
+
+        sessionMap.set(key, session);
+
+        return sessionMap;
+      }, new Map())
+      .values(),
+  );
+
+  return { rooms, sessions: mergedSessions };
 }
 
 async function readJsonResponse(response) {
@@ -205,6 +305,11 @@ function clampSession(startTime, endTime) {
 function getCurrentMonthInput() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function getStartOfCurrentMonthInput() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
 }
 
 function getDateInput(date) {
@@ -242,7 +347,7 @@ function LedScheduleBoard() {
   const [campusName, setCampusName] = useState(getCampusFromUrl);
   const [selectedBoardDate, setSelectedBoardDate] = useState(getTodayDateInput);
   const [rows, setRows] = useState([]);
-  const [rooms, setRooms] = useState(defaultRooms.map((room) => room.name));
+  const [rooms, setRooms] = useState(getFixedRoomNames(getCampusFromUrl()));
   const [dayName, setDayName] = useState(getDayNameForDate(getTodayDateInput()).toUpperCase());
   const [now, setNow] = useState(new Date());
   const [error, setError] = useState('');
@@ -275,7 +380,7 @@ function LedScheduleBoard() {
             ? payload.rooms
                 .map((room) => (typeof room === 'string' ? room : room?.room_name))
                 .filter(Boolean)
-            : [],
+            : getFixedRoomNames(campusName),
         );
         setDayName((payload.dayName || getDayNameForDate(selectedBoardDate)).toUpperCase());
         setError('');
@@ -298,7 +403,7 @@ function LedScheduleBoard() {
   }, [campusName, selectedBoardDate]);
 
   const roomRows = useMemo(() => {
-    const sourceRooms = rooms.length > 0 ? rooms : defaultRooms.map((room) => room.name);
+    const sourceRooms = rooms.length > 0 ? rooms : getFixedRoomNames(campusName);
     const roomMap = sourceRooms.reduce((roomList, roomName) => {
       roomList.set(roomName, []);
       return roomList;
@@ -308,6 +413,10 @@ function LedScheduleBoard() {
       const roomName = row.room_name || 'Unassigned Room';
 
       if (!roomMap.has(roomName)) {
+        if (campusName !== 'All Campuses') {
+          return;
+        }
+
         roomMap.set(roomName, []);
       }
 
@@ -333,6 +442,7 @@ function LedScheduleBoard() {
   const timeFontSize = `clamp(0.72rem, ${densityScale * 1.04}vw, 1.35rem)`;
   const topicFontSize = `clamp(0.58rem, ${densityScale * 0.78}vw, 0.98rem)`;
   const roomFontSize = `clamp(0.78rem, ${densityScale * 1.24}vw, 1.5rem)`;
+  const sseFontSize = `clamp(0.56rem, ${densityScale * 0.66}vw, 0.82rem)`;
 
   return (
     <main className="relative flex h-screen items-center justify-center overflow-hidden bg-[#e5e5e5] p-4 text-black">
@@ -403,15 +513,15 @@ function LedScheduleBoard() {
               >
                 {roomRows.map((room) => (
                   <div className="flex min-h-0 gap-1.5" key={room.roomName}>
-                    <aside className="flex w-[13%] min-w-24 shrink-0 flex-col justify-center rounded-[7px] border border-white/50 bg-white/55 px-2.5 py-2 text-black shadow-lg backdrop-blur-lg">
-                      <div className="truncate font-black tracking-wide" style={{ fontSize: roomFontSize }}>
+                    <aside className="flex w-[18%] min-w-[9.5rem] max-w-[15rem] shrink-0 flex-col justify-center rounded-[7px] border border-white/50 bg-white/55 px-2.5 py-2 text-black shadow-lg backdrop-blur-lg">
+                      <div className="break-words font-black leading-tight tracking-wide" style={{ fontSize: roomFontSize }}>
                         {room.roomName}
                       </div>
                     </aside>
 
-                    <div className="flex min-w-0 flex-1 gap-1.5 overflow-hidden rounded-[7px] border border-white/35 bg-white/20 p-1.5 backdrop-blur-md">
+                    <div className="grid min-w-0 flex-1 auto-rows-fr gap-1.5 overflow-hidden rounded-[7px] border border-white/35 bg-white/20 p-1.5 backdrop-blur-md md:grid-cols-2 xl:grid-cols-3">
                       {room.sessions.length === 0 ? (
-                        <div className="flex min-w-0 flex-1 items-center justify-center rounded-[7px] border border-dashed border-white/50 bg-white/30 text-sm font-bold tracking-wide text-black/45 backdrop-blur-lg">
+                        <div className="flex min-w-0 items-center justify-center rounded-[7px] border border-dashed border-white/50 bg-white/30 text-sm font-bold tracking-wide text-black/45 backdrop-blur-lg md:col-span-2 xl:col-span-3">
                           No sessions scheduled
                         </div>
                       ) : (
@@ -425,26 +535,27 @@ function LedScheduleBoard() {
                           return (
                             <article
                               className={[
-                                'led-session-card relative flex min-w-0 flex-1 flex-col justify-center overflow-hidden rounded-[7px] border border-white/50 bg-white/60 px-2 py-1.5 text-black shadow-lg backdrop-blur-lg',
+                                'led-session-card relative flex min-w-0 flex-col justify-center overflow-hidden rounded-[7px] border border-white/50 bg-white/60 px-2.5 py-2 text-black shadow-lg backdrop-blur-lg',
                                 isLive ? 'led-session-live' : '',
                               ].join(' ')}
                               key={session.id || `${room.roomName}-${session.time_slot}-${session.topic_batch}`}
                             >
                               <div
-                                className="relative z-10 truncate font-black uppercase tracking-wide text-black/85"
+                                className="relative z-10 break-words font-black uppercase leading-tight tracking-wide text-black/85"
                                 style={{ fontSize: timeFontSize }}
                               >
                                 {session.time_slot}
                               </div>
                               <div
-                                className="relative z-10 mt-1 overflow-hidden break-words font-black leading-tight tracking-wide text-black"
+                                className="relative z-10 mt-1 break-words font-black leading-tight tracking-wide text-black"
                                 style={{ fontSize: topicFontSize }}
                               >
                                 {session.topic_batch}
                               </div>
                               {session.student_service_name ? (
                                 <div
-                                  className="relative z-10 mt-1 truncate text-[0.65em] font-bold tracking-wide text-black/65"
+                                  className="relative z-10 mt-1 break-words font-bold leading-tight tracking-wide text-black/65"
+                                  style={{ fontSize: sseFontSize }}
                                 >
                                   SSE-{session.student_service_name}
                                 </div>
@@ -467,33 +578,51 @@ function LedScheduleBoard() {
 
 const analyticsCampusOptions = [
   { label: 'All', value: '' },
-  { label: 'Pyay Campus', value: 'Pyay Campus Room' },
-  { label: 'U Wisara Campus', value: 'U Wisara Campus Room KPI' },
-  { label: 'Times City', value: 'Time City Room' },
-  { label: 'Sule Campus', value: 'Sule Room' },
-  { label: 'Pan Chan Tower', value: 'PanChan Tower Room' },
+  ...campusRoomDefinitions.map((campus) => ({ label: campus.label, value: campus.value })),
 ];
 
 function getAnalyticsCampusLabel(campusName) {
-  return analyticsCampusOptions.find((campus) => campus.value === campusName)?.label || campusName || 'All';
+  return getCampusLabel(campusName);
 }
 
-function getReportMonthLabel(monthInput) {
-  return new Date(`${monthInput}-01T00:00:00`).toLocaleDateString(undefined, {
-    month: 'long',
+function formatReportDateRangeLabel(startDate, endDate) {
+  const start = new Date(`${startDate}T00:00:00`);
+  const end = new Date(`${endDate}T00:00:00`);
+  const sameYear = start.getFullYear() === end.getFullYear();
+  const sameMonth = sameYear && start.getMonth() === end.getMonth();
+
+  if (sameMonth) {
+    return `${start.toLocaleDateString(undefined, {
+      month: 'long',
+    })} ${start.getDate()}-${end.getDate()}, ${start.getFullYear()}`;
+  }
+
+  if (sameYear) {
+    return `${start.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+    })} - ${end.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    })}`;
+  }
+
+  return `${start.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
     year: 'numeric',
-  });
+  })} - ${end.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })}`;
 }
 
 function getExcelSafeSheetName(name) {
   return String(name || 'Sheet')
     .replace(/[:\\/?*[\]]/g, ' ')
     .slice(0, 31);
-}
-
-function getRoomFloor(roomName) {
-  const floorMatch = String(roomName).match(/\b(\d)\d{2}\b/);
-  return floorMatch ? `Floor ${floorMatch[1]}` : '';
 }
 
 function getRoomCapacity(row) {
@@ -540,7 +669,8 @@ function getUtilizationMeta(hoursUsed) {
 
 function ManagerAnalytics() {
   const [selectedCampus, setSelectedCampus] = useState('');
-  const [selectedMonth, setSelectedMonth] = useState(getCurrentMonthInput);
+  const [startDate, setStartDate] = useState(getStartOfCurrentMonthInput);
+  const [endDate, setEndDate] = useState(getTodayDateInput);
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState({ type: 'loading', message: 'Loading manager analytics...' });
   const [isExporting, setIsExporting] = useState(false);
@@ -552,7 +682,7 @@ function ManagerAnalytics() {
       setStatus({ type: 'loading', message: 'Loading manager analytics...' });
 
       try {
-        const params = new URLSearchParams({ month: selectedMonth });
+        const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
 
         if (selectedCampus) {
           params.set('campus_name', selectedCampus);
@@ -577,10 +707,16 @@ function ManagerAnalytics() {
       }
     }
 
+    if (!startDate || !endDate || startDate > endDate) {
+      setRows([]);
+      setStatus({ type: 'error', message: 'Choose a valid report date range.' });
+      return () => controller.abort();
+    }
+
     loadAnalytics();
 
     return () => controller.abort();
-  }, [selectedCampus, selectedMonth]);
+  }, [selectedCampus, startDate, endDate]);
 
   const campusGroups = useMemo(() => {
     const groupedRows = new Map();
@@ -611,11 +747,20 @@ function ManagerAnalytics() {
       }));
   }, [rows]);
 
-  async function exportMonthlyReport() {
+  async function exportRangeReport() {
     setIsExporting(true);
 
     try {
-      const params = new URLSearchParams({ month: selectedMonth });
+      if (!startDate || !endDate || startDate > endDate) {
+        throw new Error('Choose a valid report date range.');
+      }
+
+      const params = new URLSearchParams({ start_date: startDate, end_date: endDate });
+
+      if (selectedCampus) {
+        params.set('campus_name', selectedCampus);
+      }
+
       const response = await fetch(`/api/room-usage-history/summary?${params.toString()}`);
       const payload = await readJsonResponse(response);
 
@@ -624,18 +769,44 @@ function ManagerAnalytics() {
       }
 
       const exportRows = Array.isArray(payload.rows) ? payload.rows : [];
-      const exportCampusGroups = analyticsCampusOptions
-        .filter((campus) => campus.value)
+      const includedCampuses = analyticsCampusOptions.filter((campus) =>
+        selectedCampus ? campus.value === selectedCampus : campus.value,
+      );
+      const exportCampusGroups = includedCampuses
         .map((campus) => ({
           ...campus,
-          rows: exportRows
-            .filter((row) => row.campus_name === campus.value)
-            .sort((firstRow, secondRow) => String(firstRow.room_name).localeCompare(String(secondRow.room_name), undefined, { numeric: true })),
-        }));
+          rows: (() => {
+            const campusRows = exportRows.filter((row) => row.campus_name === campus.value);
+            const fixedRooms = getFixedRoomNames(campus.value);
+
+            if (fixedRooms.length === 0) {
+              return campusRows.sort((firstRow, secondRow) =>
+                String(firstRow.room_name).localeCompare(String(secondRow.room_name), undefined, { numeric: true }),
+              );
+            }
+
+            const rowMap = new Map(campusRows.map((row) => [row.room_name, row]));
+
+            return fixedRooms.map((roomName) => ({
+              campus_name: campus.value,
+              room_name: roomName,
+              room_capacity: rowMap.get(roomName)?.room_capacity || '',
+              total_times_used: Number(rowMap.get(roomName)?.total_times_used || 0),
+              total_hours_used: Number(rowMap.get(roomName)?.total_hours_used || 0),
+            }));
+          })(),
+        }))
+        .filter((group) => group.rows.length > 0);
       const workbook = XLSX.utils.book_new();
-      const totalRooms = exportRows.length;
-      const totalTimesUsed = exportRows.reduce((total, row) => total + Number(row.total_times_used || 0), 0);
-      const totalHoursUsed = exportRows.reduce((total, row) => total + Number(row.total_hours_used || 0), 0);
+      const totalRooms = exportCampusGroups.reduce((total, group) => total + group.rows.length, 0);
+      const totalTimesUsed = exportCampusGroups.reduce(
+        (total, group) => total + group.rows.reduce((groupTotal, row) => groupTotal + Number(row.total_times_used || 0), 0),
+        0,
+      );
+      const totalHoursUsed = exportCampusGroups.reduce(
+        (total, group) => total + group.rows.reduce((groupTotal, row) => groupTotal + Number(row.total_hours_used || 0), 0),
+        0,
+      );
       const summaryRows = [
         ['KPI', 'Value'],
         ['Total Rooms Reported', totalRooms],
@@ -662,23 +833,22 @@ function ManagerAnalytics() {
 
       exportCampusGroups.forEach((group) => {
         const sheetRows = [
-          ['Room Name', 'Floor', 'Room Capacity', 'Total Times Used', 'Total Hours Occupied'],
+          ['Room Name', 'Room Capacity', 'Total Times Used', 'Total Hours Occupied'],
           ...group.rows.map((row) => [
             row.room_name,
-            getRoomFloor(row.room_name),
             getRoomCapacity(row),
             Number(row.total_times_used || 0),
             Number(Number(row.total_hours_used || 0).toFixed(2)),
           ]),
         ];
         const worksheet = XLSX.utils.aoa_to_sheet(sheetRows);
-        styleHeaderRow(worksheet, 5);
-        worksheet['!cols'] = [{ wch: 28 }, { wch: 14 }, { wch: 16 }, { wch: 18 }, { wch: 20 }];
+        styleHeaderRow(worksheet, 4);
+        worksheet['!cols'] = [{ wch: 28 }, { wch: 16 }, { wch: 18 }, { wch: 20 }];
         XLSX.utils.book_append_sheet(workbook, worksheet, getExcelSafeSheetName(group.label));
       });
 
-      const fileMonth = getReportMonthLabel(selectedMonth).replace(/\s+/g, '_');
-      XLSX.writeFile(workbook, `University_Room_KPI_Report_${fileMonth}.xlsx`, { cellStyles: true });
+      const fileRange = `${startDate}_to_${endDate}`;
+      XLSX.writeFile(workbook, `University_Room_KPI_Report_${fileRange}.xlsx`, { cellStyles: true });
     } catch (error) {
       setStatus({ type: 'error', message: error.message });
     } finally {
@@ -689,10 +859,10 @@ function ManagerAnalytics() {
   return (
     <section className="mx-auto max-w-[1500px] px-5 py-5">
       <div className="mb-5 border border-zinc-200 bg-white p-4 shadow-sm">
-        <div className="grid gap-4 lg:grid-cols-[1fr_260px_220px_auto] lg:items-end">
+        <div className="grid gap-4 lg:grid-cols-[1fr_220px_220px_220px_auto] lg:items-end">
           <div>
             <h1 className="text-2xl font-semibold tracking-normal">Manager Analytics</h1>
-            <p className="mt-1 text-sm text-zinc-600">Filter monthly room utilization by campus.</p>
+            <p className="mt-1 text-sm text-zinc-600">Filter room utilization by campus and exact date range.</p>
           </div>
 
           <label className="text-sm font-semibold text-zinc-700">
@@ -711,23 +881,34 @@ function ManagerAnalytics() {
           </label>
 
           <label className="text-sm font-semibold text-zinc-700">
-            Month
+            Start Date
             <input
               className="mt-2 h-11 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm font-medium text-zinc-950 outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10"
-              onChange={(event) => setSelectedMonth(event.target.value)}
-              type="month"
-              value={selectedMonth}
+              onChange={(event) => setStartDate(event.target.value)}
+              type="date"
+              value={startDate}
+            />
+          </label>
+
+          <label className="text-sm font-semibold text-zinc-700">
+            End Date
+            <input
+              className="mt-2 h-11 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm font-medium text-zinc-950 outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10"
+              min={startDate}
+              onChange={(event) => setEndDate(event.target.value)}
+              type="date"
+              value={endDate}
             />
           </label>
 
           <button
             className="inline-flex h-11 items-center justify-center gap-2 rounded-md border border-emerald-500/30 bg-white/80 px-4 text-sm font-bold text-zinc-800 shadow-sm backdrop-blur-md transition hover:border-emerald-500/50 hover:bg-white hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
             disabled={isExporting}
-            onClick={exportMonthlyReport}
+            onClick={exportRangeReport}
             type="button"
           >
             <span aria-hidden="true">📗</span>
-            {isExporting ? 'Preparing...' : 'Export Monthly Report'}
+            {isExporting ? 'Preparing...' : 'Export Excel Report'}
           </button>
         </div>
       </div>
@@ -742,7 +923,7 @@ function ManagerAnalytics() {
         </div>
       ) : campusGroups.length === 0 ? (
         <div className="border border-zinc-200 bg-white px-4 py-10 text-center text-sm font-medium text-zinc-600 shadow-sm">
-          No room usage history found for this campus and month.
+          No room usage history found for this campus and date range.
         </div>
       ) : (
         <div className="grid gap-5">
@@ -753,7 +934,7 @@ function ManagerAnalytics() {
                   {getAnalyticsCampusLabel(group.campusName)} Analytics
                 </h2>
                 <p className="mt-1 text-sm text-zinc-600">
-                  {group.rows.length} room{group.rows.length === 1 ? '' : 's'} sorted from most used to least used.
+                  {group.rows.length} room{group.rows.length === 1 ? '' : 's'} from {formatReportDateRangeLabel(startDate, endDate)}.
                 </p>
               </div>
 
@@ -817,28 +998,22 @@ function App() {
   const [selectedCampus, setSelectedCampus] = useState(campuses[0]);
   const [selectedScheduleDate, setSelectedScheduleDate] = useState(getTodayDateInput);
   const [schedules, setSchedules] = useState(() => ({
-    [scheduleKey(getTodayDateInput(), campuses[0])]: createSchedule(),
+    [scheduleKey(getTodayDateInput(), campuses[0])]: createSchedule(campuses[0]),
   }));
   const [loadedKeys, setLoadedKeys] = useState({});
-  const [roomDraft, setRoomDraft] = useState('');
   const [modalRoomId, setModalRoomId] = useState(null);
   const [editingSessionId, setEditingSessionId] = useState(null);
   const [expandedSessionId, setExpandedSessionId] = useState(null);
-  const [roomPendingDelete, setRoomPendingDelete] = useState(null);
-  const [sessionDraft, setSessionDraft] = useState({
-    startTime: '08:00',
-    endTime: '09:00',
-    topicBatch: '',
-    numStudents: '',
-    studentServiceName: '',
-  });
+  const [sessionDraft, setSessionDraft] = useState(() => createSessionDraft(getDayNameForDate(getTodayDateInput()), getTodayDateInput()));
   const [status, setStatus] = useState({ type: 'idle', message: '' });
   const [undoStack, setUndoStack] = useState([]);
+  const [deletedRecurringGroupIdsByKey, setDeletedRecurringGroupIdsByKey] = useState({});
 
   const selectedDay = getDayNameForDate(selectedScheduleDate);
   const activeKey = scheduleKey(selectedScheduleDate, selectedCampus);
-  const activeSchedule = schedules[activeKey] || createSchedule();
+  const activeSchedule = schedules[activeKey] || createSchedule(selectedCampus);
   const activeSessions = activeSchedule.sessions;
+  const deletedRecurringGroupIds = deletedRecurringGroupIdsByKey[activeKey] || [];
   const activeUndoActionIndex = getLastActionIndexForKey(undoStack, activeKey);
   const activeUndoAction = activeUndoActionIndex === -1 ? null : undoStack[activeUndoActionIndex];
 
@@ -868,7 +1043,8 @@ function App() {
 
         setSchedules((currentSchedules) => {
           const currentSchedule = ensureSchedule(currentSchedules, activeKey);
-          const savedRooms = Array.isArray(payload.rooms) && payload.rooms.length > 0 ? payload.rooms : currentSchedule.rooms;
+          const savedRooms =
+            Array.isArray(payload.rooms) && payload.rooms.length > 0 ? payload.rooms : getFixedRoomNames(selectedCampus);
 
           return {
             ...currentSchedules,
@@ -907,13 +1083,59 @@ function App() {
           topic_batch: session.topicBatch,
           num_students: session.numStudents,
           student_service_name: session.studentServiceName,
+          recurrence_group_id: session.recurrenceGroupId || null,
+          recurrence_days: session.recurrenceDays || [],
+          recurrence_start_date: session.recurrenceStartDate || null,
+          recurrence_end_date: session.recurrenceEndDate || null,
+          recurrence_exception_dates: session.recurrenceExceptionDates || [],
         };
       }),
     [activeSchedule.rooms, activeSessions, selectedCampus, selectedDay, selectedScheduleDate],
   );
 
+  const seriesRowsToPublish = useMemo(() => {
+    const seriesMap = new Map();
+
+    Object.entries(schedules).forEach(([key, schedule]) => {
+      if (getCampusFromScheduleKey(key) !== selectedCampus) {
+        return;
+      }
+
+      schedule.sessions.forEach((session) => {
+        if (!session.recurrenceGroupId || seriesMap.has(session.recurrenceGroupId)) {
+          return;
+        }
+
+        const room = schedule.rooms.find((candidate) => candidate.id === session.roomId);
+        const roomName = room?.name.trim();
+
+        if (!roomName) {
+          return;
+        }
+
+        seriesMap.set(session.recurrenceGroupId, {
+          schedule_date: session.recurrenceStartDate || selectedScheduleDate,
+          day_name: session.recurrenceDays?.[0] || selectedDay,
+          campus_name: selectedCampus,
+          room_name: roomName,
+          time_slot: `${timeInputToLabel(session.startTime)} - ${timeInputToLabel(session.endTime)}`,
+          topic_batch: session.topicBatch,
+          num_students: session.numStudents,
+          student_service_name: session.studentServiceName,
+          recurrence_group_id: session.recurrenceGroupId,
+          recurrence_days: session.recurrenceDays || [],
+          recurrence_start_date: session.recurrenceStartDate || null,
+          recurrence_end_date: session.recurrenceEndDate || null,
+          recurrence_exception_dates: session.recurrenceExceptionDates || [],
+        });
+      });
+    });
+
+    return Array.from(seriesMap.values());
+  }, [schedules, selectedCampus, selectedDay, selectedScheduleDate]);
+
   function ensureSchedule(currentSchedules, key) {
-    return currentSchedules[key] || createSchedule();
+    return currentSchedules[key] || createSchedule(getCampusFromScheduleKey(key));
   }
 
   function pushUndoAction(action) {
@@ -922,6 +1144,17 @@ function App() {
 
   function removeUndoActionsForKey(key) {
     setUndoStack((currentStack) => currentStack.filter((action) => action.key !== key));
+  }
+
+  function invalidateCampusScheduleCache(campusName, keepKey = null) {
+    setLoadedKeys((currentLoadedKeys) =>
+      Object.fromEntries(
+        Object.entries(currentLoadedKeys).filter(([key]) => {
+          const sameCampus = getCampusFromScheduleKey(key) === campusName;
+          return sameCampus ? key === keepKey : true;
+        }),
+      ),
+    );
   }
 
   function undoLastCanvasAction() {
@@ -937,6 +1170,53 @@ function App() {
     setSchedules((currentSchedules) => {
       const currentSchedule = ensureSchedule(currentSchedules, actionToRestore.key);
 
+      if (actionToRestore.type === 'recurring-session-delete') {
+        const exceptionDate = actionToRestore.exceptionDate;
+        const recurrenceGroupId = actionToRestore.recurrenceGroupId;
+
+        return Object.fromEntries(
+          Object.entries(currentSchedules).map(([key, schedule]) => {
+            if (getCampusFromScheduleKey(key) !== getCampusFromScheduleKey(actionToRestore.key)) {
+              return [key, schedule];
+            }
+
+            const nextSessions = schedule.sessions.map((session) => {
+              if (session.recurrenceGroupId !== recurrenceGroupId) {
+                return session;
+              }
+
+              return {
+                ...session,
+                recurrenceExceptionDates: normalizeRecurrenceExceptionDates(
+                  (session.recurrenceExceptionDates || []).filter((date) => date !== exceptionDate),
+                ),
+              };
+            });
+
+            if (key !== actionToRestore.key) {
+              return [key, { ...schedule, sessions: nextSessions }];
+            }
+
+            if (nextSessions.some((session) => session.id === actionToRestore.session.id)) {
+              return [key, { ...schedule, sessions: nextSessions }];
+            }
+
+            return [
+              key,
+              {
+                ...schedule,
+                sessions: insertAtIndex(nextSessions, actionToRestore.sessionIndex, {
+                  ...actionToRestore.session,
+                  recurrenceExceptionDates: normalizeRecurrenceExceptionDates(
+                    (actionToRestore.session.recurrenceExceptionDates || []).filter((date) => date !== exceptionDate),
+                  ),
+                }),
+              },
+            ];
+          }),
+        );
+      }
+
       if (actionToRestore.type === 'session-delete') {
         if (currentSchedule.sessions.some((session) => session.id === actionToRestore.session.id)) {
           return currentSchedules;
@@ -947,25 +1227,6 @@ function App() {
           [actionToRestore.key]: {
             ...currentSchedule,
             sessions: insertAtIndex(currentSchedule.sessions, actionToRestore.sessionIndex, actionToRestore.session),
-          },
-        };
-      }
-
-      if (actionToRestore.type === 'room-delete') {
-        const restoredSessions = actionToRestore.sessions.filter(
-          ({ session }) => !currentSchedule.sessions.some((currentSession) => currentSession.id === session.id),
-        );
-
-        return {
-          ...currentSchedules,
-          [actionToRestore.key]: {
-            rooms: currentSchedule.rooms.some((room) => room.id === actionToRestore.room.id)
-              ? currentSchedule.rooms
-              : insertAtIndex(currentSchedule.rooms, actionToRestore.roomIndex, actionToRestore.room),
-            sessions: restoredSessions.reduce(
-              (sessions, { session, sessionIndex }) => insertAtIndex(sessions, sessionIndex, session),
-              currentSchedule.sessions,
-            ),
           },
         };
       }
@@ -999,131 +1260,197 @@ function App() {
     setStatus({ type: 'idle', message: '' });
   }
 
-  function addRoom() {
-    const name = roomDraft.trim();
-
-    if (!name) {
-      return;
-    }
-
-    setSchedules((currentSchedules) => {
-      const currentSchedule = ensureSchedule(currentSchedules, activeKey);
+  function toggleRecurrenceDay(dayName) {
+    setSessionDraft((draft) => {
+      const alreadySelected = draft.recurrenceDays.includes(dayName);
+      const nextDays = alreadySelected
+        ? draft.recurrenceDays.filter((currentDay) => currentDay !== dayName)
+        : [...draft.recurrenceDays, dayName];
 
       return {
-        ...currentSchedules,
-        [activeKey]: {
-          ...currentSchedule,
-          rooms: [
-            ...currentSchedule.rooms,
-            {
-              id: roomIdFromName(`${name}-${Date.now()}`),
-              name,
-            },
-          ],
-        },
-      };
-    });
-    setRoomDraft('');
-  }
-
-  function renameRoom(roomId, name) {
-    setSchedules((currentSchedules) => {
-      const currentSchedule = ensureSchedule(currentSchedules, activeKey);
-
-      return {
-        ...currentSchedules,
-        [activeKey]: {
-          ...currentSchedule,
-          rooms: currentSchedule.rooms.map((room) => (room.id === roomId ? { ...room, name: name.trimStart() } : room)),
-        },
+        ...draft,
+        recurrenceDays: normalizeRecurrenceDays(nextDays),
       };
     });
   }
 
-  function deleteRoom(roomId) {
-    const deletedRoom = activeSchedule.rooms.find((room) => room.id === roomId);
-    const deletedSessions = activeSchedule.sessions
-      .map((session, sessionIndex) => ({ session, sessionIndex }))
-      .filter(({ session }) => session.roomId === roomId);
-
-    if (!deletedRoom) {
-      return;
-    }
-
-    pushUndoAction({
-      key: activeKey,
-      type: 'room-delete',
-      label: `${deletedRoom.name} room deletion`,
-      room: deletedRoom,
-      roomIndex: activeSchedule.rooms.findIndex((room) => room.id === roomId),
-      sessions: deletedSessions,
-    });
-
-    setSchedules((currentSchedules) => {
-      const currentSchedule = ensureSchedule(currentSchedules, activeKey);
-
-      return {
-        ...currentSchedules,
-        [activeKey]: {
-          rooms: currentSchedule.rooms.filter((room) => room.id !== roomId),
-          sessions: currentSchedule.sessions.filter((session) => session.roomId !== roomId),
-        },
-      };
-    });
-    setRoomPendingDelete(null);
-  }
-
-  function openSessionModal(roomId) {
-    setModalRoomId(roomId);
-    setEditingSessionId(null);
-    setSessionDraft({
-      startTime: '08:00',
-      endTime: '09:00',
-      topicBatch: '',
-      numStudents: '',
-      studentServiceName: '',
-    });
-  }
-
-  function closeSessionModal() {
-    setModalRoomId(null);
-    setEditingSessionId(null);
-    setSessionDraft({
-      startTime: '08:00',
-      endTime: '09:00',
-      topicBatch: '',
-      numStudents: '',
-      studentServiceName: '',
-    });
-  }
-
-  function openEditSession(session) {
-    setModalRoomId(session.roomId);
-    setEditingSessionId(session.id);
-    setExpandedSessionId(null);
-    setSessionDraft({
-      startTime: session.startTime,
-      endTime: session.endTime,
-      topicBatch: session.topicBatch,
-      numStudents: session.numStudents,
-      studentServiceName: session.studentServiceName,
-    });
-  }
-
-  function saveSession(event) {
-    event.preventDefault();
-
+  function applySessionSave(updateScope = 'single') {
     if (!modalRoomId || !sessionDraft.topicBatch.trim()) {
       return;
     }
 
+    const recurrenceDays = normalizeRecurrenceDays(sessionDraft.recurrenceDays);
+    const isSeriesUpdate = updateScope === 'series';
+
+    if (sessionDraft.repeatEnabled && isSeriesUpdate) {
+      if (!sessionDraft.recurrenceStartDate || !sessionDraft.recurrenceEndDate || recurrenceDays.length === 0) {
+        setStatus({ type: 'error', message: 'Choose at least one weekday and a valid repeat date range.' });
+        return;
+      }
+
+      if (sessionDraft.recurrenceStartDate > sessionDraft.recurrenceEndDate) {
+        setStatus({ type: 'error', message: 'Repeat end date must be on or after the repeat start date.' });
+        return;
+      }
+    }
+
     const normalizedTime = clampSession(sessionDraft.startTime, sessionDraft.endTime);
+    const existingSession = editingSessionId
+      ? activeSchedule.sessions.find((session) => session.id === editingSessionId)
+      : null;
+    const recurrenceGroupId =
+      sessionDraft.repeatEnabled && isSeriesUpdate ? sessionDraft.recurrenceGroupId || createRecurringGroupId() : null;
+    const nextSession = {
+      roomId: modalRoomId,
+      startTime: normalizedTime.startTime,
+      endTime: normalizedTime.endTime,
+      topicBatch: sessionDraft.topicBatch.trim(),
+      numStudents: sessionDraft.numStudents.trim(),
+      studentServiceName: sessionDraft.studentServiceName.trim(),
+      recurrenceGroupId,
+      recurrenceDays: sessionDraft.repeatEnabled && isSeriesUpdate ? recurrenceDays : [],
+      recurrenceStartDate: sessionDraft.repeatEnabled && isSeriesUpdate ? sessionDraft.recurrenceStartDate : null,
+      recurrenceEndDate: sessionDraft.repeatEnabled && isSeriesUpdate ? sessionDraft.recurrenceEndDate : null,
+      recurrenceExceptionDates:
+        sessionDraft.repeatEnabled && isSeriesUpdate ? normalizeRecurrenceExceptionDates(sessionDraft.recurrenceExceptionDates) : [],
+    };
+    const recurrenceScheduleDates =
+      sessionDraft.repeatEnabled && isSeriesUpdate
+        ? buildRecurringScheduleDates(sessionDraft.recurrenceStartDate, sessionDraft.recurrenceEndDate, recurrenceDays).filter(
+            (scheduleDate) => !nextSession.recurrenceExceptionDates.includes(scheduleDate),
+          )
+        : [selectedScheduleDate];
+
+    if (sessionDraft.repeatEnabled && isSeriesUpdate && recurrenceScheduleDates.length === 0) {
+      setStatus({ type: 'error', message: 'No matching dates were found in the selected repeat range.' });
+      return;
+    }
+
+    if (existingSession?.recurrenceGroupId && isSeriesUpdate && existingSession.recurrenceGroupId !== recurrenceGroupId) {
+      setDeletedRecurringGroupIdsByKey((currentState) => ({
+        ...currentState,
+        [activeKey]: [...new Set([...(currentState[activeKey] || []), existingSession.recurrenceGroupId])],
+      }));
+    }
 
     setSchedules((currentSchedules) => {
-      const currentSchedule = ensureSchedule(currentSchedules, activeKey);
+      if (existingSession?.recurrenceGroupId && !isSeriesUpdate) {
+        const exceptionDate = selectedScheduleDate;
+        const nextSchedules = Object.fromEntries(
+          Object.entries(currentSchedules).map(([key, schedule]) => {
+            if (getCampusFromScheduleKey(key) !== selectedCampus) {
+              return [key, schedule];
+            }
+
+            const scheduleDate = key.split('::')[0];
+            const nextSessions = [];
+
+            schedule.sessions.forEach((session) => {
+              if (session.recurrenceGroupId !== existingSession.recurrenceGroupId) {
+                nextSessions.push(session);
+                return;
+              }
+
+              const nextExceptionDates = normalizeRecurrenceExceptionDates([
+                ...(session.recurrenceExceptionDates || []),
+                exceptionDate,
+              ]);
+
+              if (scheduleDate !== exceptionDate) {
+                nextSessions.push({
+                  ...session,
+                  recurrenceExceptionDates: nextExceptionDates,
+                });
+              }
+            });
+
+            return [
+              key,
+              {
+                ...schedule,
+                sessions: nextSessions,
+              },
+            ];
+          }),
+        );
+
+        const currentSchedule = ensureSchedule(nextSchedules, activeKey);
+
+        nextSchedules[activeKey] = {
+          ...currentSchedule,
+          sessions: [
+            ...currentSchedule.sessions,
+            {
+              id: editingSessionId || `session-${Date.now()}`,
+              ...nextSession,
+            },
+          ],
+        };
+
+        return nextSchedules;
+      }
+
+      const schedulesWithoutPreviousSeries =
+        existingSession?.recurrenceGroupId && existingSession.recurrenceGroupId !== recurrenceGroupId
+          ? Object.fromEntries(
+              Object.entries(currentSchedules).map(([key, schedule]) => {
+                if (getCampusFromScheduleKey(key) !== selectedCampus) {
+                  return [key, schedule];
+                }
+
+                return [
+                  key,
+                  {
+                    ...schedule,
+                    sessions: schedule.sessions.filter(
+                      (session) => session.recurrenceGroupId !== existingSession.recurrenceGroupId,
+                    ),
+                  },
+                ];
+              }),
+            )
+          : currentSchedules;
+
+      if (isSeriesUpdate) {
+        const nextSchedules = Object.fromEntries(
+          Object.entries(schedulesWithoutPreviousSeries).map(([key, schedule]) => {
+            if (getCampusFromScheduleKey(key) !== selectedCampus) {
+              return [key, schedule];
+            }
+
+            return [
+              key,
+              {
+                ...schedule,
+                sessions: schedule.sessions.filter((session) => session.recurrenceGroupId !== recurrenceGroupId),
+              },
+            ];
+          }),
+        );
+
+        recurrenceScheduleDates.forEach((scheduleDate) => {
+          const scheduleKeyValue = scheduleKey(scheduleDate, selectedCampus);
+          const scheduleForDate = ensureSchedule(nextSchedules, scheduleKeyValue);
+
+          nextSchedules[scheduleKeyValue] = {
+            ...scheduleForDate,
+            sessions: [
+              ...scheduleForDate.sessions.filter((session) => session.id !== editingSessionId),
+              {
+                id: scheduleDate === selectedScheduleDate && editingSessionId ? editingSessionId : `session-${Date.now()}-${scheduleDate}`,
+                ...nextSession,
+              },
+            ],
+          };
+        });
+
+        return nextSchedules;
+      }
+
+      const currentSchedule = ensureSchedule(schedulesWithoutPreviousSeries, activeKey);
 
       return {
-        ...currentSchedules,
+        ...schedulesWithoutPreviousSeries,
         [activeKey]: {
           ...currentSchedule,
           sessions: editingSessionId
@@ -1131,12 +1458,7 @@ function App() {
                 session.id === editingSessionId
                   ? {
                       ...session,
-                      roomId: modalRoomId,
-                      startTime: normalizedTime.startTime,
-                      endTime: normalizedTime.endTime,
-                      topicBatch: sessionDraft.topicBatch.trim(),
-                      numStudents: sessionDraft.numStudents.trim(),
-                      studentServiceName: sessionDraft.studentServiceName.trim(),
+                      ...nextSession,
                     }
                   : session,
               )
@@ -1144,18 +1466,61 @@ function App() {
                 ...currentSchedule.sessions,
                 {
                   id: `session-${Date.now()}`,
-                  roomId: modalRoomId,
-                  startTime: normalizedTime.startTime,
-                  endTime: normalizedTime.endTime,
-                  topicBatch: sessionDraft.topicBatch.trim(),
-                  numStudents: sessionDraft.numStudents.trim(),
-                  studentServiceName: sessionDraft.studentServiceName.trim(),
+                  ...nextSession,
                 },
               ],
         },
       };
     });
+
+    if (isSeriesUpdate) {
+      setStatus({
+        type: 'success',
+        message: `Prepared ${recurrenceScheduleDates.length} repeated date${recurrenceScheduleDates.length === 1 ? '' : 's'}. Click Save Schedule to store them.`,
+      });
+    } else if (existingSession?.recurrenceGroupId) {
+      setStatus({ type: 'success', message: 'Prepared a one-time update for this date only. Click Save Schedule to store it.' });
+    }
+
     closeSessionModal();
+  }
+
+  function openSessionModal(roomId) {
+    setModalRoomId(roomId);
+    setEditingSessionId(null);
+    setSessionDraft(createSessionDraft(selectedDay, selectedScheduleDate));
+  }
+
+  function closeSessionModal() {
+    setModalRoomId(null);
+    setEditingSessionId(null);
+    setSessionDraft(createSessionDraft(selectedDay, selectedScheduleDate));
+  }
+
+  function openEditSession(session) {
+    setModalRoomId(session.roomId);
+    setEditingSessionId(session.id);
+    setExpandedSessionId(null);
+    setSessionDraft(
+      createSessionDraft(selectedDay, selectedScheduleDate, {
+        startTime: session.startTime,
+        endTime: session.endTime,
+        topicBatch: session.topicBatch,
+        numStudents: session.numStudents,
+        studentServiceName: session.studentServiceName,
+        repeatEnabled: Boolean(session.recurrenceGroupId),
+        recurrenceDays: session.recurrenceDays?.length ? session.recurrenceDays : [selectedDay],
+        recurrenceStartDate: normalizeDateInputValue(session.recurrenceStartDate) || selectedScheduleDate,
+        recurrenceEndDate: normalizeDateInputValue(session.recurrenceEndDate) || selectedScheduleDate,
+        recurrenceGroupId: session.recurrenceGroupId,
+        recurrenceExceptionDates: session.recurrenceExceptionDates || [],
+      }),
+    );
+  }
+
+  function saveSession(event) {
+    event.preventDefault();
+    applySessionSave(sessionDraft.repeatEnabled ? 'series' : 'single');
   }
 
   function removeSession(sessionId) {
@@ -1163,6 +1528,66 @@ function App() {
     const deletedSession = activeSchedule.sessions[deletedSessionIndex];
 
     if (!deletedSession) {
+      return;
+    }
+
+    if (deletedSession.recurrenceGroupId) {
+      const exceptionDate = selectedScheduleDate;
+
+      pushUndoAction({
+        key: activeKey,
+        type: 'recurring-session-delete',
+        label: `${deletedSession.topicBatch} repeated schedule deletion`,
+        session: deletedSession,
+        sessionIndex: deletedSessionIndex,
+        recurrenceGroupId: deletedSession.recurrenceGroupId,
+        exceptionDate,
+      });
+
+      setSchedules((currentSchedules) =>
+        Object.fromEntries(
+          Object.entries(currentSchedules).map(([key, schedule]) => {
+            if (getCampusFromScheduleKey(key) !== selectedCampus) {
+              return [key, schedule];
+            }
+
+            const scheduleDate = key.split('::')[0];
+            const nextSessions = [];
+
+            schedule.sessions.forEach((session) => {
+              if (session.recurrenceGroupId !== deletedSession.recurrenceGroupId) {
+                nextSessions.push(session);
+                return;
+              }
+
+              const nextExceptionDates = normalizeRecurrenceExceptionDates([
+                ...(session.recurrenceExceptionDates || []),
+                exceptionDate,
+              ]);
+
+              if (scheduleDate !== exceptionDate) {
+                nextSessions.push({
+                  ...session,
+                  recurrenceExceptionDates: nextExceptionDates,
+                });
+              }
+            });
+
+            return [
+              key,
+              {
+                ...schedule,
+                sessions: nextSessions,
+              },
+            ];
+          }),
+        ),
+      );
+      setDeletedRecurringGroupIdsByKey((currentState) => ({
+        ...currentState,
+        [activeKey]: (currentState[activeKey] || []).filter((groupId) => groupId !== deletedSession.recurrenceGroupId),
+      }));
+      setStatus({ type: 'success', message: 'Removed this repeated schedule only. Save Schedule to apply the exception date.' });
       return;
     }
 
@@ -1211,6 +1636,8 @@ function App() {
         campus_name: selectedCampus,
         rooms: activeSchedule.rooms.map((room) => room.name.trim()).filter(Boolean),
         rows: rowsToPublish,
+        series_rows: seriesRowsToPublish,
+        deleted_recurrence_group_ids: deletedRecurringGroupIds,
       }),
     });
 
@@ -1220,9 +1647,14 @@ function App() {
       throw new Error(payload.error || 'Publish failed.');
     }
 
+    invalidateCampusScheduleCache(selectedCampus);
     setLoadedKeys((currentLoadedKeys) => ({
       ...currentLoadedKeys,
       [activeKey]: true,
+    }));
+    setDeletedRecurringGroupIdsByKey((currentState) => ({
+      ...currentState,
+      [activeKey]: [],
     }));
     removeUndoActionsForKey(activeKey);
 
@@ -1234,39 +1666,14 @@ function App() {
 
     try {
       const payload = await saveScheduleSnapshot();
+      const repeatedSuffix =
+        payload.repeatedRows > payload.sourceRows
+          ? ` Expanded to ${payload.repeatedRows} dated session${payload.repeatedRows === 1 ? '' : 's'}.`
+          : '';
 
       setStatus({
         type: 'success',
-        message: `Saved ${payload.inserted} session${payload.inserted === 1 ? '' : 's'}.`,
-      });
-    } catch (error) {
-      setStatus({ type: 'error', message: error.message });
-    }
-  }
-
-  async function finalizeSchedule() {
-    setStatus({ type: 'loading', message: `Finalizing ${selectedScheduleDate} at ${selectedCampus}...` });
-
-    try {
-      await saveScheduleSnapshot();
-
-      const response = await fetch('/api/weekly-kpi/finalize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          schedule_date: selectedScheduleDate,
-          campus_name: selectedCampus,
-        }),
-      });
-      const payload = await readJsonResponse(response);
-
-      if (!response.ok) {
-        throw new Error(payload.error || 'Finalize failed.');
-      }
-
-      setStatus({
-        type: 'success',
-        message: `Finalized ${payload.finalizedRows} session${payload.finalizedRows === 1 ? '' : 's'} for analytics.`,
+        message: `Saved ${payload.sourceRows} session${payload.sourceRows === 1 ? '' : 's'}.${repeatedSuffix} Room usage history will auto-finalize at 11:00 PM.`,
       });
     } catch (error) {
       setStatus({ type: 'error', message: error.message });
@@ -1274,6 +1681,8 @@ function App() {
   }
 
   const modalRoom = activeSchedule.rooms.find((room) => room.id === modalRoomId);
+  const editingSession = editingSessionId ? activeSchedule.sessions.find((session) => session.id === editingSessionId) : null;
+  const editingRecurringSession = Boolean(editingSession?.recurrenceGroupId);
 
   return (
     <main className="min-h-screen bg-zinc-100 text-zinc-950">
@@ -1386,14 +1795,6 @@ function App() {
                 >
                   Save Schedule
                 </button>
-                <button
-                  className="rounded-md bg-emerald-700 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
-                  disabled={status.type === 'loading'}
-                  onClick={finalizeSchedule}
-                  type="button"
-                >
-                  Finalize Day
-                </button>
               </div>
             </div>
           ) : null}
@@ -1406,32 +1807,11 @@ function App() {
         <section className="mx-auto max-w-[1500px] px-5 py-5">
           <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
             <div>
-              <h1 className="text-2xl font-semibold tracking-normal">Dynamic Timeline Lanes</h1>
+              <h1 className="text-2xl font-semibold tracking-normal">Fixed Room Timeline</h1>
               <p className="mt-1 text-sm text-zinc-600">
                 {selectedCampus} - {selectedScheduleDate} ({selectedDay}) - {activeSessions.length} active session
                 {activeSessions.length === 1 ? '' : 's'}
               </p>
-            </div>
-
-            <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
-              <input
-                className="h-10 min-w-64 rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10"
-                onChange={(event) => setRoomDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    addRoom();
-                  }
-                }}
-                placeholder="New room name"
-                value={roomDraft}
-              />
-              <button
-                className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-zinc-50"
-                onClick={addRoom}
-                type="button"
-              >
-                + Add Room
-              </button>
             </div>
           </div>
 
@@ -1454,23 +1834,7 @@ function App() {
               return (
                 <div className="grid grid-cols-[220px_1fr] border-b border-zinc-200" key={room.id}>
                   <aside className="flex min-h-28 flex-col justify-center border-r border-zinc-200 bg-zinc-50 px-4 py-3">
-                    <div className="flex items-start gap-2">
-                      <input
-                        aria-label={`Edit ${room.name}`}
-                        className="min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 text-sm font-semibold text-zinc-950 outline-none focus:border-zinc-300 focus:bg-white focus:ring-2 focus:ring-zinc-900/10"
-                        onChange={(event) => renameRoom(room.id, event.target.value)}
-                        placeholder="Enter room name"
-                        value={room.name}
-                      />
-                      <button
-                        aria-label={`Delete ${room.name}`}
-                        className="rounded border border-red-200 bg-white px-2 py-0.5 text-xs font-bold text-red-700 hover:bg-red-50"
-                        onClick={() => setRoomPendingDelete(room)}
-                        type="button"
-                      >
-                        X
-                      </button>
-                    </div>
+                    <div className="min-w-0 px-1 py-0.5 text-sm font-semibold text-zinc-950">{room.name}</div>
                     <div className="mt-1 text-xs font-medium text-zinc-500">{roomSessions.length} session blocks</div>
                     <button
                       className="mt-3 w-fit rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-xs font-semibold hover:bg-zinc-50"
@@ -1521,6 +1885,11 @@ function App() {
                             <div className="mt-1 truncate text-xs opacity-90">
                               {session.numStudents || '-'} students
                             </div>
+                            {session.recurrenceGroupId ? (
+                              <div className="mt-1 truncate text-[11px] font-semibold uppercase tracking-wide text-white/90">
+                                Repeats: {session.recurrenceDays.join(', ')}
+                              </div>
+                            ) : null}
                           </div>
                           <button
                             aria-label={`Edit ${session.topicBatch}`}
@@ -1561,7 +1930,7 @@ function App() {
 
       {modalRoom ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 px-4">
-          <form className="w-full max-w-md rounded-lg bg-white p-5 shadow-xl" onSubmit={saveSession}>
+          <form className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-lg bg-white p-5 shadow-xl" onSubmit={saveSession}>
             <div className="mb-4">
               <h2 className="text-lg font-semibold text-zinc-950">
                 {editingSessionId ? 'Edit Session Block' : 'Add Session Block'}
@@ -1630,6 +1999,93 @@ function App() {
               />
             </label>
 
+            <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-zinc-800">Repeat Schedule</div>
+                  <div className="mt-1 text-xs text-zinc-600">
+                    Repeat this session for selected weekdays across a date range.
+                  </div>
+                </div>
+                <button
+                  className={[
+                    'rounded-md px-3 py-2 text-xs font-semibold',
+                    sessionDraft.repeatEnabled ? 'bg-zinc-900 text-white' : 'border border-zinc-300 bg-white text-zinc-800',
+                  ].join(' ')}
+                  onClick={() =>
+                    setSessionDraft((draft) => ({
+                      ...draft,
+                      repeatEnabled: !draft.repeatEnabled,
+                      recurrenceDays: draft.recurrenceDays?.length ? draft.recurrenceDays : [selectedDay],
+                      recurrenceStartDate: draft.recurrenceStartDate || selectedScheduleDate,
+                      recurrenceEndDate: draft.recurrenceEndDate || selectedScheduleDate,
+                    }))
+                  }
+                  type="button"
+                >
+                  {sessionDraft.repeatEnabled ? 'Repeating On' : 'Set Repeat'}
+                </button>
+              </div>
+
+              {sessionDraft.repeatEnabled ? (
+                <div className="mt-4 grid gap-4">
+                  <div>
+                    <div className="text-sm font-semibold text-zinc-700">Repeat On</div>
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      {days.map((dayName) => {
+                        const isSelected = sessionDraft.recurrenceDays.includes(dayName);
+
+                        return (
+                          <button
+                            className={[
+                              'rounded-md border px-3 py-2 text-left text-sm font-medium',
+                              isSelected
+                                ? 'border-zinc-900 bg-zinc-900 text-white'
+                                : 'border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50',
+                            ].join(' ')}
+                            key={dayName}
+                            onClick={() => toggleRecurrenceDay(dayName)}
+                            type="button"
+                          >
+                            {dayName}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <label className="text-sm font-semibold text-zinc-700">
+                      Repeat Start Date
+                      <input
+                        className="mt-2 h-10 w-full rounded-md border border-zinc-300 px-3 text-sm outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10"
+                        onChange={(event) =>
+                          setSessionDraft((draft) => ({ ...draft, recurrenceStartDate: event.target.value }))
+                        }
+                        type="date"
+                        value={sessionDraft.recurrenceStartDate}
+                      />
+                    </label>
+
+                    <label className="text-sm font-semibold text-zinc-700">
+                      Repeat End Date
+                      <input
+                        className="mt-2 h-10 w-full rounded-md border border-zinc-300 px-3 text-sm outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10"
+                        onChange={(event) =>
+                          setSessionDraft((draft) => ({ ...draft, recurrenceEndDate: event.target.value }))
+                        }
+                        type="date"
+                        value={sessionDraft.recurrenceEndDate}
+                      />
+                    </label>
+                  </div>
+                  <p className="text-xs text-zinc-600">
+                    Save this session, then click <span className="font-semibold">Save Schedule</span> to apply the repeated dates.
+                  </p>
+                </div>
+              ) : null}
+            </div>
+
             <div className="mt-5 flex justify-end gap-2">
               <button
                 className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-zinc-50"
@@ -1638,43 +2094,36 @@ function App() {
               >
                 Cancel
               </button>
-              <button
-                className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800"
-                type="submit"
-              >
-                {editingSessionId ? 'Update Session' : 'Save Session'}
-              </button>
+              {editingRecurringSession ? (
+                <>
+                  <button
+                    className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-semibold text-zinc-800 hover:bg-zinc-50"
+                    onClick={() => applySessionSave('single')}
+                    type="button"
+                  >
+                    Update This Schedule
+                  </button>
+                  <button
+                    className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800"
+                    onClick={() => applySessionSave('series')}
+                    type="button"
+                  >
+                    Update All Repeat Range
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800"
+                  type="submit"
+                >
+                  {editingSessionId ? 'Update Session' : 'Save Session'}
+                </button>
+              )}
             </div>
           </form>
         </div>
       ) : null}
 
-      {roomPendingDelete ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 px-4">
-          <div className="w-full max-w-sm rounded-lg bg-white p-5 shadow-xl">
-            <h2 className="text-lg font-semibold text-zinc-950">Delete room?</h2>
-            <p className="mt-2 text-sm text-zinc-600">
-              Are you sure you want to delete {roomPendingDelete.name}? This will also remove its session blocks.
-            </p>
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-zinc-50"
-                onClick={() => setRoomPendingDelete(null)}
-                type="button"
-              >
-                Cancel
-              </button>
-              <button
-                className="rounded-md bg-red-700 px-4 py-2 text-sm font-semibold text-white hover:bg-red-800"
-                onClick={() => deleteRoom(roomPendingDelete.id)}
-                type="button"
-              >
-                Yes
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
     </main>
   );
 }

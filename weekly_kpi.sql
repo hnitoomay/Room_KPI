@@ -12,7 +12,12 @@ CREATE TABLE IF NOT EXISTS public.weekly_kpi (
     campus_name VARCHAR(100) NOT NULL,
     topic_batch VARCHAR(255) NOT NULL,
     num_students VARCHAR(50),
-    student_service_name VARCHAR(100)
+    student_service_name VARCHAR(100),
+    recurrence_group_id VARCHAR(100),
+    recurrence_days VARCHAR(100),
+    recurrence_start_date DATE,
+    recurrence_end_date DATE,
+    recurrence_exception_dates VARCHAR(255)
 );
 
 CREATE TABLE IF NOT EXISTS public.room_usage_history (
@@ -53,7 +58,12 @@ ALTER TABLE public.weekly_kpi
     ADD COLUMN IF NOT EXISTS campus_name VARCHAR(100),
     ADD COLUMN IF NOT EXISTS topic_batch VARCHAR(255),
     ADD COLUMN IF NOT EXISTS num_students VARCHAR(50),
-    ADD COLUMN IF NOT EXISTS student_service_name VARCHAR(100);
+    ADD COLUMN IF NOT EXISTS student_service_name VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS recurrence_group_id VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS recurrence_days VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS recurrence_start_date DATE,
+    ADD COLUMN IF NOT EXISTS recurrence_end_date DATE,
+    ADD COLUMN IF NOT EXISTS recurrence_exception_dates VARCHAR(255);
 
 ALTER TABLE public.room_usage_history
     ADD COLUMN IF NOT EXISTS schedule_date DATE,

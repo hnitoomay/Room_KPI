@@ -34,7 +34,7 @@ http://127.0.0.1:5173/entrance-led?campus_name=Time%20City%20Room
 
 ## Timeline Publish Behavior
 
-The dashboard has Campus and Day dropdowns, a dynamic room list, and horizontal room lanes from `08:00 AM` through `06:00 PM`. Staff can add rooms and create or delete session blocks with start time, end time, topic/batch name, and number of students.
+The dashboard has Campus and Day dropdowns, a fixed room list for each campus, and horizontal room lanes from `08:00 AM` through `06:00 PM`. Staff only manage session blocks with start time, end time, topic/batch name, and number of students.
 
 When Campus or Day changes, the dashboard loads saved rows from `GET /api/weekly-kpi/schedule`. The PostgreSQL table still has one `time_slot` column, so the app stores start and end time as a single value like `08:00 AM - 09:00 AM` and parses that range back into visual timeline blocks.
 
