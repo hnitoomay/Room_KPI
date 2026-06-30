@@ -18,6 +18,7 @@ const timelineHours = [
   '05:00 PM',
   '06:00 PM',
 ];
+const timelineBoundaryHours = [...timelineHours, '07:00 PM'];
 const blockColors = ['bg-sky-600', 'bg-emerald-600', 'bg-amber-600', 'bg-violet-600', 'bg-rose-600'];
 
 function getCampusFromUrl() {
@@ -1616,7 +1617,7 @@ function App() {
     const dayStart = timeToMinutes('08:00');
     const visualDayEnd = timeToMinutes('19:00');
     const start = timeToMinutes(session.startTime);
-    const end = Math.min(timeToMinutes(session.endTime) + 60, visualDayEnd);
+    const end = Math.min(timeToMinutes(session.endTime), visualDayEnd);
     const left = ((start - dayStart) / (visualDayEnd - dayStart)) * 100;
     const width = ((end - start) / (visualDayEnd - dayStart)) * 100;
 
@@ -1819,12 +1820,31 @@ function App() {
           <div className="min-w-[1480px]">
             <div className="grid grid-cols-[220px_1fr] border-b border-zinc-300 bg-zinc-900 text-white">
               <div className="border-r border-zinc-700 px-4 py-3 text-sm font-semibold">Rooms</div>
-              <div className="grid grid-cols-11">
-                {timelineHours.map((hour) => (
-                  <div className="border-r border-zinc-700 px-3 py-3 text-center text-xs font-semibold" key={hour}>
-                    {hour}
-                  </div>
-                ))}
+              <div className="relative h-14 overflow-hidden">
+                <div className="absolute inset-x-0 bottom-0 top-6 grid grid-cols-11">
+                  {timelineHours.map((hour) => (
+                    <div className="border-r border-zinc-700" key={hour} />
+                  ))}
+                </div>
+                {timelineBoundaryHours.map((hour, index) => {
+                  const position = `${(index / (timelineBoundaryHours.length - 1)) * 100}%`;
+                  const alignmentClass =
+                    index === 0
+                      ? 'translate-x-0'
+                      : index === timelineBoundaryHours.length - 1
+                        ? '-translate-x-full'
+                        : '-translate-x-1/2';
+
+                  return (
+                    <div
+                      className={`absolute top-2 text-xs font-semibold whitespace-nowrap text-white/90 ${alignmentClass}`}
+                      key={hour}
+                      style={{ left: position }}
+                    >
+                      {hour}
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
