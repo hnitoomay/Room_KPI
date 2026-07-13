@@ -639,6 +639,56 @@ async function finalizeScheduleForCampus(client, scheduleDate, campusName) {
   return finalizedRows;
 }
 
+async function finalizeDueSchedules(databasePool, cutoffDate) {
+  const dueSchedulesResult = await databasePool.query(
+    `SELECT wk.schedule_date, wk.campus_name
+     FROM weekly_kpi wk
+     WHERE wk.schedule_date <= $1
+       AND NOT EXISTS (
+         SELECT 1
+         FROM schedule_finalization sf
+         WHERE sf.schedule_date = wk.schedule_date
+           AND sf.campus_name = wk.campus_name
+       )
+     GROUP BY wk.schedule_date, wk.campus_name
+     ORDER BY wk.schedule_date, wk.campus_name`,
+    [cutoffDate],
+  );
+
+  const finalizedSchedules = [];
+
+  for (const row of dueSchedulesResult.rows) {
+    const scheduleDate = String(row.schedule_date).slice(0, 10);
+    const campusName = String(row.campus_name || '').trim();
+
+    if (!scheduleDate || !campusName) {
+      continue;
+    }
+
+    let client;
+
+    try {
+      client = await databasePool.connect();
+      await client.query('BEGIN');
+      const finalizedRows = await finalizeScheduleForCampus(client, scheduleDate, campusName);
+      await client.query('COMMIT');
+      finalizedSchedules.push({ scheduleDate, campusName, finalizedRows });
+    } catch (error) {
+      if (client) {
+        await client.query('ROLLBACK');
+      }
+
+      console.error(`Failed to finalize ${campusName} for ${scheduleDate}.`, error);
+    } finally {
+      if (client) {
+        client.release();
+      }
+    }
+  }
+
+  return finalizedSchedules;
+}
+
 function getTimeZoneParts(timeZone, date = new Date()) {
   const formatter = new Intl.DateTimeFormat('en-CA', {
     timeZone,
@@ -665,8 +715,8 @@ function getTimeZoneDateInput(timeZone, date = new Date()) {
 }
 
 let autoFinalizeTimer = null;
-let lastAutoFinalizeKey = null;
 let autoFinalizeInFlight = false;
+const autoFinalizeTimeZone = process.env.AUTO_FINALIZE_TIMEZONE || 'Asia/Yangon';
 
 function startAutoFinalizeScheduler() {
   if (autoFinalizeTimer) {
@@ -675,7 +725,6 @@ function startAutoFinalizeScheduler() {
 
   const autoFinalizeHour = Number(process.env.AUTO_FINALIZE_HOUR || 23);
   const autoFinalizeMinute = Number(process.env.AUTO_FINALIZE_MINUTE || 0);
-  const autoFinalizeTimeZone = process.env.AUTO_FINALIZE_TIMEZONE || 'Asia/Yangon';
 
   async function runAutoFinalizeTick() {
     const nowParts = getTimeZoneParts(autoFinalizeTimeZone);
@@ -685,55 +734,20 @@ function startAutoFinalizeScheduler() {
       return;
     }
 
-    if (lastAutoFinalizeKey === scheduleDate || autoFinalizeInFlight) {
+    if (autoFinalizeInFlight) {
       return;
     }
 
     autoFinalizeInFlight = true;
 
     try {
-      const campusResult = await pool.query(
-        `SELECT DISTINCT wk.campus_name
-         FROM weekly_kpi wk
-         WHERE wk.schedule_date = $1
-           AND NOT EXISTS (
-             SELECT 1
-            FROM schedule_finalization sf
-            WHERE sf.schedule_date = wk.schedule_date
-              AND sf.campus_name = wk.campus_name
-           )
-         ORDER BY wk.campus_name`,
-        [scheduleDate],
-      );
+      const finalizedSchedules = await finalizeDueSchedules(pool, scheduleDate);
 
-      for (const row of campusResult.rows) {
-        const campusName = String(row.campus_name || '').trim();
-
-        if (!campusName) {
-          continue;
-        }
-
-        let client;
-
-        try {
-          client = await pool.connect();
-          await client.query('BEGIN');
-          const finalizedRows = await finalizeScheduleForCampus(client, scheduleDate, campusName);
-          await client.query('COMMIT');
-          console.log(`Auto-finalized ${campusName} for ${scheduleDate} with ${finalizedRows} session(s).`);
-        } catch (error) {
-          if (client) {
-            await client.query('ROLLBACK');
-          }
-          console.error(`Failed to auto-finalize ${campusName} for ${scheduleDate}.`, error);
-        } finally {
-          if (client) {
-            client.release();
-          }
-        }
+      for (const finalizedSchedule of finalizedSchedules) {
+        console.log(
+          `Auto-finalized ${finalizedSchedule.campusName} for ${finalizedSchedule.scheduleDate} with ${finalizedSchedule.finalizedRows} session(s).`,
+        );
       }
-
-      lastAutoFinalizeKey = scheduleDate;
     } catch (error) {
       console.error(`Failed to scan campuses for auto-finalization on ${scheduleDate}.`, error);
     } finally {
@@ -1141,6 +1155,38 @@ app.post('/api/weekly-kpi/finalize', async (request, response) => {
     if (client) {
       client.release();
     }
+  }
+});
+
+app.get('/api/cron/finalize', async (_request, response) => {
+  if (!databaseUrl) {
+    return response.status(503).json({
+      ok: false,
+      databaseConfigured: false,
+      error: 'DATABASE_URL is not configured.',
+    });
+  }
+
+  try {
+    const cutoffDate = getTimeZoneDateInput(autoFinalizeTimeZone);
+    const finalizedSchedules = await finalizeDueSchedules(pool, cutoffDate);
+
+    response.json({
+      ok: true,
+      cutoffDate,
+      finalizedCount: finalizedSchedules.length,
+      finalizedSchedules: finalizedSchedules.map((item) => ({
+        scheduleDate: item.scheduleDate,
+        campusName: item.campusName,
+        finalizedRows: item.finalizedRows,
+      })),
+    });
+  } catch (error) {
+    console.error('Cron finalize failed.', error);
+    response.status(500).json({
+      ok: false,
+      error: error.code || error.message,
+    });
   }
 });
 
