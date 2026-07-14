@@ -624,19 +624,26 @@ async function replaceRoomUsageHistory(client, scheduleDate, campusName, rows) {
 }
 
 async function finalizeScheduleForCampus(client, scheduleDate, campusName) {
+  const normalizedScheduleDate = parseDateInput(scheduleDate);
+  const normalizedCampusName = String(campusName || '').trim();
+
+  if (!normalizedScheduleDate || !normalizedCampusName) {
+    throw new Error(`Invalid finalization target: date=${String(scheduleDate)} campus=${String(campusName)}`);
+  }
+
   const scheduleResult = await client.query(
     `SELECT schedule_date, day_name, campus_name, room_name, time_slot, topic_batch, num_students, student_service_name,
             recurrence_group_id, recurrence_days, recurrence_start_date, recurrence_end_date, recurrence_exception_dates
      FROM weekly_kpi
      WHERE schedule_date = $1 AND campus_name = $2
      ORDER BY room_name, time_slot, id`,
-    [scheduleDate, campusName],
+    [normalizedScheduleDate, normalizedCampusName],
   );
 
   const finalizedRows = await replaceRoomUsageHistory(
     client,
-    scheduleDate,
-    campusName,
+    normalizedScheduleDate,
+    normalizedCampusName,
     scheduleResult.rows.map(normalizeRow).filter(isPublishable),
   );
 
@@ -645,13 +652,19 @@ async function finalizeScheduleForCampus(client, scheduleDate, campusName) {
      VALUES ($1, $2, NOW())
      ON CONFLICT (schedule_date, campus_name)
      DO UPDATE SET finalized_at = EXCLUDED.finalized_at`,
-    [scheduleDate, campusName],
+    [normalizedScheduleDate, normalizedCampusName],
   );
 
   return finalizedRows;
 }
 
 async function finalizeDueSchedules(databasePool, cutoffDate) {
+  const normalizedCutoffDate = parseDateInput(cutoffDate);
+
+  if (!normalizedCutoffDate) {
+    throw new Error(`Invalid finalization cutoff date: ${String(cutoffDate)}`);
+  }
+
   const dueSchedulesResult = await databasePool.query(
     `SELECT wk.schedule_date, wk.campus_name
      FROM weekly_kpi wk
@@ -664,13 +677,13 @@ async function finalizeDueSchedules(databasePool, cutoffDate) {
        )
      GROUP BY wk.schedule_date, wk.campus_name
      ORDER BY wk.schedule_date, wk.campus_name`,
-    [cutoffDate],
+    [normalizedCutoffDate],
   );
 
   const finalizedSchedules = [];
 
   for (const row of dueSchedulesResult.rows) {
-    const scheduleDate = String(row.schedule_date).slice(0, 10);
+    const scheduleDate = parseDateInput(row.schedule_date);
     const campusName = String(row.campus_name || '').trim();
 
     if (!scheduleDate || !campusName) {
