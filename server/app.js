@@ -113,6 +113,18 @@ function getNextDateInput(scheduleDate) {
   return parseDateInput(nextDate);
 }
 
+function getPreviousDateInput(scheduleDate) {
+  const parsedDate = parseDateInput(scheduleDate);
+
+  if (!parsedDate) {
+    return null;
+  }
+
+  const previousDate = new Date(`${parsedDate}T00:00:00Z`);
+  previousDate.setUTCDate(previousDate.getUTCDate() - 1);
+  return parseDateInput(previousDate);
+}
+
 function parseDateRange(startDateInput, endDateInput) {
   const startDate = parseDateInput(startDateInput);
   const endDate = parseDateInput(endDateInput);
@@ -717,14 +729,29 @@ function getTimeZoneDateInput(timeZone, date = new Date()) {
 let autoFinalizeTimer = null;
 let autoFinalizeInFlight = false;
 const autoFinalizeTimeZone = process.env.AUTO_FINALIZE_TIMEZONE || 'Asia/Yangon';
+const autoFinalizeHour = Number(process.env.AUTO_FINALIZE_HOUR || 23);
+const autoFinalizeMinute = Number(process.env.AUTO_FINALIZE_MINUTE || 0);
+
+function getLatestDueScheduleDate(date = new Date()) {
+  const nowParts = getTimeZoneParts(autoFinalizeTimeZone, date);
+  const todayDate = `${nowParts.year}-${nowParts.month}-${nowParts.day}`;
+  const currentHour = Number(nowParts.hour);
+  const currentMinute = Number(nowParts.minute);
+  const isAfterCutoff =
+    currentHour > autoFinalizeHour || (currentHour === autoFinalizeHour && currentMinute >= autoFinalizeMinute);
+
+  return isAfterCutoff ? todayDate : getPreviousDateInput(todayDate);
+}
+
+function shouldFinalizeScheduleDate(scheduleDate, date = new Date()) {
+  const latestDueScheduleDate = getLatestDueScheduleDate(date);
+  return Boolean(scheduleDate && latestDueScheduleDate && scheduleDate <= latestDueScheduleDate);
+}
 
 function startAutoFinalizeScheduler() {
   if (autoFinalizeTimer) {
     return;
   }
-
-  const autoFinalizeHour = Number(process.env.AUTO_FINALIZE_HOUR || 23);
-  const autoFinalizeMinute = Number(process.env.AUTO_FINALIZE_MINUTE || 0);
 
   async function runAutoFinalizeTick() {
     const nowParts = getTimeZoneParts(autoFinalizeTimeZone);
@@ -898,6 +925,14 @@ app.get('/api/room-usage-history/summary', async (request, response) => {
   }
 
   try {
+    const latestDueScheduleDate = getLatestDueScheduleDate();
+    const finalizeThroughDate =
+      latestDueScheduleDate && dateRange.endDate < latestDueScheduleDate ? dateRange.endDate : latestDueScheduleDate;
+
+    if (finalizeThroughDate && finalizeThroughDate >= dateRange.startDate) {
+      await finalizeDueSchedules(pool, finalizeThroughDate);
+    }
+
     const params = [dateRange.startDate, dateRange.exclusiveEndDate];
     const campusFilter = campusName ? 'AND campus_name = $3' : '';
 
@@ -1004,8 +1039,16 @@ app.post('/api/weekly-kpi/matrix', async (request, response) => {
       );
     }
 
+    let finalizedRows = 0;
+    let finalizedNow = false;
+
+    if (shouldFinalizeScheduleDate(scheduleDate)) {
+      finalizedRows = await finalizeScheduleForCampus(client, scheduleDate, campusName);
+      finalizedNow = true;
+    }
+
     await client.query('COMMIT');
-    response.json({ inserted: publishableRows.length, rooms: roomNames.length });
+    response.json({ inserted: publishableRows.length, rooms: roomNames.length, finalizedNow, finalizedRows });
   } catch (error) {
     if (client) {
       await client.query('ROLLBACK');
@@ -1057,6 +1100,7 @@ app.post('/api/weekly-kpi/schedule', async (request, response) => {
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+    const replacedRecurringDates = [];
 
     if (rowsToPersist.length > 0) {
       const targetDates = [...new Set(rowsToPersist.map((row) => row.schedule_date).filter(Boolean))];
@@ -1089,6 +1133,18 @@ app.post('/api/weekly-kpi/schedule', async (request, response) => {
       }
     }
 
+    if (replacedRecurringGroupIds.length > 0) {
+      const replacedDateResult = await client.query(
+        `SELECT DISTINCT schedule_date
+         FROM weekly_kpi
+         WHERE campus_name = $1
+           AND recurrence_group_id = ANY($2::text[])`,
+        [campusName, replacedRecurringGroupIds],
+      );
+
+      replacedRecurringDates.push(...replacedDateResult.rows.map((row) => parseDateInput(row.schedule_date)).filter(Boolean));
+    }
+
     await client.query('DELETE FROM weekly_kpi WHERE schedule_date = $1 AND campus_name = $2', [scheduleDate, campusName]);
 
     if (replacedRecurringGroupIds.length > 0) {
@@ -1109,12 +1165,31 @@ app.post('/api/weekly-kpi/schedule', async (request, response) => {
       );
     }
 
+    const finalizableDates = [
+      scheduleDate,
+      ...rowsToPersist.map((row) => row.schedule_date),
+      ...replacedRecurringDates,
+    ]
+      .filter((dateInput, index, items) => dateInput && items.indexOf(dateInput) === index)
+      .filter((dateInput) => shouldFinalizeScheduleDate(dateInput))
+      .sort();
+
+    let finalizedDates = 0;
+    let finalizedRows = 0;
+
+    for (const finalizedDate of finalizableDates) {
+      finalizedRows += await finalizeScheduleForCampus(client, finalizedDate, campusName);
+      finalizedDates += 1;
+    }
+
     await client.query('COMMIT');
     response.json({
       inserted: rowsToPersist.length,
       sourceRows: publishableRows.length,
       repeatedRows: expandedRecurringRows.length,
       rooms: roomNames.length,
+      finalizedDates,
+      finalizedRows,
     });
   } catch (error) {
     if (client) {

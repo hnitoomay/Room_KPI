@@ -706,7 +706,10 @@ export default function SchedulerApp() {
 
       setStatus({
         type: 'success',
-        message: `Saved ${payload.sourceRows} session${payload.sourceRows === 1 ? '' : 's'}.${repeatedSuffix} Room usage history will auto-finalize at 11:00 PM.`,
+        message:
+          payload.finalizedDates > 0
+            ? `Saved ${payload.sourceRows} session${payload.sourceRows === 1 ? '' : 's'}.${repeatedSuffix} Finalized ${payload.finalizedRows} room usage row${payload.finalizedRows === 1 ? '' : 's'} for due schedule dates.`
+            : `Saved ${payload.sourceRows} session${payload.sourceRows === 1 ? '' : 's'}.${repeatedSuffix} Room usage will finalize automatically after 11:00 PM, with catch-up when analytics is opened.`,
       });
     } catch (error) {
       setStatus({ type: 'error', message: error.message });
